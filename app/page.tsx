@@ -189,7 +189,8 @@ export default function Home() {
 
         try {
           data = JSON.parse(event.data);
-        } catch {
+        } console.log("DERIV RAW RESPONSE:", data);
+        catch {
           setConnectionError("Could not read the market-data response.");
           return;
         }
