@@ -2,9 +2,11 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties } from "react";
 
 const WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public";
+const STORAGE_KEY = "hope-ai-deriv-history-v242";
+const MAX_TICKS = 10000;
+const TRAINING_TICKS = 100;
 
 const MARKETS = [
   { symbol: "R_10", name: "Volatility 10" },
@@ -19,256 +21,270 @@ const MARKETS = [
   { symbol: "1HZ100V", name: "Volatility 100 (1s)" },
 ];
 
+const CONTRACTS = [
+  "MATCHES",
+  "DIFFERS",
+  "EVEN",
+  "ODD",
+  "RISE",
+  "FALL",
+] as const;
+
+type Contract = (typeof CONTRACTS)[number];
+
 type Tick = {
   quote: number;
   digit: number;
   time: number;
 };
 
-type MarketState = {
-  ticks: Tick[];
-  price: number | null;
-  pipSize: number;
-  status: string;
-};
-
-type Contract =
-  | "MATCHES"
-  | "DIFFERS"
-  | "EVEN"
-  | "ODD"
-  | "RISE"
-  | "FALL";
-
-type Candidate = {
+type Prediction = {
   contract: Contract;
-  target?: number;
-  sampleRate: number;
-  baseline: number;
-  edge: number;
-  recentRate: number;
-  label: string;
+  digit?: number;
+  expected: string;
+  reason: string;
 };
 
-const blankMarket = (): MarketState => ({
-  ticks: [],
-  price: null,
-  pipSize: 0.01,
-  status: "WAITING",
-});
+type TestResult = {
+  prediction: Prediction;
+  correct: boolean;
+  time: number;
+};
 
-const initialMarkets = (): Record<string, MarketState> =>
-  Object.fromEntries(
-    MARKETS.map((market) => [market.symbol, blankMarket()])
+type MarketHistory = Record<string, Tick[]>;
+
+function getDigit(price: number, pip: number): number {
+  const decimals = Math.max(
+    0,
+    Math.min(10, Math.round(-Math.log10(pip)))
   );
 
-function decimals(pip: number): number {
-  if (!Number.isFinite(pip) || pip <= 0) return 2;
-
-  if (pip >= 1) {
-    return Math.min(10, Math.round(pip));
-  }
-
-  const value = pip.toString();
-
-  if (value.includes("e-")) {
-    return Math.min(10, Number(value.split("e-")[1]));
-  }
-
-  return Math.min(10, (value.split(".")[1] || "").length);
+  const formatted = price.toFixed(decimals);
+  return Number(formatted.replace(".", "").slice(-1));
 }
 
-function lastDigit(price: number, pip: number): number {
-  const digits = price
-    .toFixed(decimals(pip))
-    .replace(".", "");
+function countDigits(ticks: Tick[]) {
+  const counts = Array(10).fill(0);
 
-  return Number(digits[digits.length - 1]);
+  ticks.forEach((tick) => {
+    counts[tick.digit]++;
+  });
+
+  return counts;
 }
 
-function percentage(count: number, total: number): number {
-  return total > 0 ? (count / total) * 100 : 0;
-}
-
-function buildCandidates(
+function makePrediction(
   ticks: Tick[],
-  target: number
-): Candidate[] {
-  if (ticks.length < 100) return [];
+  contract: Contract
+): Prediction | null {
+  if (ticks.length < TRAINING_TICKS) return null;
 
-  const recent = ticks.slice(-100);
-  const digits = ticks.map((tick) => tick.digit);
-  const recentDigits = recent.map((tick) => tick.digit);
+  const sample = ticks.slice(-500);
+  const counts = countDigits(sample);
+  const total = sample.length;
 
-  const candidates: Candidate[] = [];
+  if (contract === "MATCHES") {
+    const digit = counts.indexOf(Math.max(...counts));
 
-  const matchFull = percentage(
-    digits.filter((digit) => digit === target).length,
-    digits.length
-  );
+    return {
+      contract,
+      digit,
+      expected: `Digit ${digit}`,
+      reason: `Digit ${digit} appeared most often in the training sample.`,
+    };
+  }
 
-  const matchRecent = percentage(
-    recentDigits.filter((digit) => digit === target).length,
-    recentDigits.length
-  );
+  if (contract === "DIFFERS") {
+    const digit = counts.indexOf(Math.min(...counts));
 
-  const matchRate = 0.65 * matchFull + 0.35 * matchRecent;
+    return {
+      contract,
+      digit,
+      expected: `Differs from digit ${digit}`,
+      reason: `Digit ${digit} appeared least often in the training sample.`,
+    };
+  }
 
-  candidates.push({
-    contract: "MATCHES",
-    target,
-    sampleRate: matchFull,
-    baseline: 10,
-    edge: matchRate - 10,
-    recentRate: matchRecent,
-    label: `Matches ${target}`,
-  });
+  if (contract === "EVEN" || contract === "ODD") {
+    const even = counts.reduce(
+      (sum, count, digit) =>
+        sum + (digit % 2 === 0 ? count : 0),
+      0
+    );
 
-  const differFull = 100 - matchFull;
-  const differRecent = 100 - matchRecent;
-  const differRate = 0.65 * differFull + 0.35 * differRecent;
+    const odd = total - even;
+    const chosen = even >= odd ? "EVEN" : "ODD";
 
-  candidates.push({
-    contract: "DIFFERS",
-    target,
-    sampleRate: differFull,
-    baseline: 90,
-    edge: differRate - 90,
-    recentRate: differRecent,
-    label: `Differs ${target}`,
-  });
-
-  const evenFull = percentage(
-    digits.filter((digit) => digit % 2 === 0).length,
-    digits.length
-  );
-
-  const evenRecent = percentage(
-    recentDigits.filter((digit) => digit % 2 === 0).length,
-    recentDigits.length
-  );
-
-  const oddFull = 100 - evenFull;
-  const oddRecent = 100 - evenRecent;
-
-  const evenRate = 0.65 * evenFull + 0.35 * evenRecent;
-  const oddRate = 0.65 * oddFull + 0.35 * oddRecent;
-
-  candidates.push({
-    contract: "EVEN",
-    sampleRate: evenFull,
-    baseline: 50,
-    edge: evenRate - 50,
-    recentRate: evenRecent,
-    label: "Even",
-  });
-
-  candidates.push({
-    contract: "ODD",
-    sampleRate: oddFull,
-    baseline: 50,
-    edge: oddRate - 50,
-    recentRate: oddRecent,
-    label: "Odd",
-  });
+    return {
+      contract,
+      expected: chosen,
+      reason: `Even: ${even} observations; Odd: ${odd} observations.`,
+    };
+  }
 
   let rises = 0;
   let falls = 0;
-  const directions: number[] = [];
 
-  for (let i = 1; i < ticks.length; i++) {
-    const direction = Math.sign(
-      ticks[i].quote - ticks[i - 1].quote
-    );
+  for (let i = 1; i < sample.length; i++) {
+    if (sample[i].quote > sample[i - 1].quote) rises++;
+    if (sample[i].quote < sample[i - 1].quote) falls++;
+  }
 
-    if (direction > 0) {
-      rises++;
-      directions.push(1);
-    } else if (direction < 0) {
-      falls++;
-      directions.push(-1);
+  const chosen = rises >= falls ? "RISE" : "FALL";
+
+  return {
+    contract,
+    expected: chosen,
+    reason: `Training movements: ${rises} rises and ${falls} falls.`,
+  };
+}
+
+function evaluatePrediction(
+  prediction: Prediction,
+  nextTick: Tick,
+  previousTick: Tick
+): boolean {
+  switch (prediction.contract) {
+    case "MATCHES":
+      return nextTick.digit === prediction.digit;
+
+    case "DIFFERS":
+      return nextTick.digit !== prediction.digit;
+
+    case "EVEN":
+      return nextTick.digit % 2 === 0;
+
+    case "ODD":
+      return nextTick.digit % 2 !== 0;
+
+    case "RISE":
+      return nextTick.quote > previousTick.quote;
+
+    case "FALL":
+      return nextTick.quote < previousTick.quote;
+
+    default:
+      return false;
+  }
+}
+
+function getWalkForwardResults(
+  ticks: Tick[],
+  contract: Contract
+): TestResult[] {
+  const results: TestResult[] = [];
+
+  // Test the most recent 1,000 possible predictions.
+  const start = Math.max(TRAINING_TICKS, ticks.length - 1000);
+
+  for (let i = start; i < ticks.length; i++) {
+    const training = ticks.slice(Math.max(0, i - 500), i);
+    const prediction = makePrediction(training, contract);
+
+    if (!prediction) continue;
+
+    const previousTick = ticks[i - 1];
+    const nextTick = ticks[i];
+
+    // Flat price movements are excluded from Rise/Fall testing.
+    if (
+      (contract === "RISE" || contract === "FALL") &&
+      nextTick.quote === previousTick.quote
+    ) {
+      continue;
     }
-  }
 
-  const directionTotal = rises + falls;
-
-  if (directionTotal >= 50) {
-    const recentDirections = directions.slice(-100);
-
-    const riseFull = percentage(rises, directionTotal);
-    const riseRecent = percentage(
-      recentDirections.filter((direction) => direction > 0).length,
-      recentDirections.length
-    );
-
-    const fallFull = 100 - riseFull;
-    const fallRecent = 100 - riseRecent;
-
-    const riseRate = 0.65 * riseFull + 0.35 * riseRecent;
-    const fallRate = 0.65 * fallFull + 0.35 * fallRecent;
-
-    candidates.push({
-      contract: "RISE",
-      sampleRate: riseFull,
-      baseline: 50,
-      edge: riseRate - 50,
-      recentRate: riseRecent,
-      label: "Rise",
-    });
-
-    candidates.push({
-      contract: "FALL",
-      sampleRate: fallFull,
-      baseline: 50,
-      edge: fallRate - 50,
-      recentRate: fallRecent,
-      label: "Fall",
+    results.push({
+      prediction,
+      correct: evaluatePrediction(
+        prediction,
+        nextTick,
+        previousTick
+      ),
+      time: nextTick.time,
     });
   }
 
-  return candidates.sort((a, b) => b.edge - a.edge);
+  return results;
+}
+
+function emptyHistory(): MarketHistory {
+  return Object.fromEntries(
+    MARKETS.map((market) => [market.symbol, []])
+  );
 }
 
 export default function Home() {
+  const [history, setHistory] = useState<MarketHistory>(emptyHistory);
   const [selectedMarket, setSelectedMarket] = useState("R_100");
-  const [markets, setMarkets] =
-    useState<Record<string, MarketState>>(initialMarkets);
-
-  const [status, setStatus] = useState("CONNECTING");
+  const [contract, setContract] = useState<Contract>("MATCHES");
+  const [connection, setConnection] = useState("CONNECTING");
   const [error, setError] = useState("");
-  const [received, setReceived] = useState(0);
   const [scannerOn, setScannerOn] = useState(true);
-  const [windowSize, setWindowSize] = useState(500);
-  const [target, setTarget] = useState(5);
-
-  const [analysis, setAnalysis] = useState<Candidate | null>(null);
-  const [analysisMessage, setAnalysisMessage] = useState(
-    "Collecting live ticks. At least 100 are needed before screening signals."
-  );
+  const [loaded, setLoaded] = useState(false);
 
   const socketRef = useRef<WebSocket | null>(null);
-  const marketsRef = useRef(markets);
-  const scannerRef = useRef(scannerOn);
+  const historyRef = useRef<MarketHistory>(emptyHistory());
+  const scannerRef = useRef(true);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedRef = useRef(false);
+  const pipRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
-    marketsRef.current = markets;
-  }, [markets]);
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+
+      if (saved) {
+        const parsed = JSON.parse(saved) as MarketHistory;
+        const restored = emptyHistory();
+
+        MARKETS.forEach(({ symbol }) => {
+          if (Array.isArray(parsed[symbol])) {
+            restored[symbol] = parsed[symbol].slice(-MAX_TICKS);
+          }
+        });
+
+        historyRef.current = restored;
+        setHistory(restored);
+      }
+    } catch {
+      setError("Saved history could not be loaded.");
+    }
+
+    setLoaded(true);
+  }, []);
 
   useEffect(() => {
     scannerRef.current = scannerOn;
   }, [scannerOn]);
 
   useEffect(() => {
+    if (!loaded) return;
+
+    const save = setTimeout(() => {
+      try {
+        localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify(history)
+        );
+      } catch {
+        setError("Phone storage is full. Some history may not save.");
+      }
+    }, 500);
+
+    return () => clearTimeout(save);
+  }, [history, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+
     stoppedRef.current = false;
+    let reconnectDelay = 2500;
 
-    let delay = 2500;
-
-    const connect = () => {
+    function connect() {
       if (stoppedRef.current) return;
 
-      setStatus("CONNECTING");
+      setConnection("CONNECTING");
 
       let ws: WebSocket;
 
@@ -276,19 +292,17 @@ export default function Home() {
         ws = new WebSocket(WS_URL);
         socketRef.current = ws;
       } catch {
-        setStatus("ERROR");
-        setError("Could not start the Deriv connection.");
-
-        reconnectRef.current = setTimeout(connect, delay);
-        delay = Math.min(delay * 2, 30000);
+        setConnection("ERROR");
+        reconnectRef.current = setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
         return;
       }
 
       ws.onopen = () => {
         if (stoppedRef.current) return;
 
-        delay = 2500;
-        setStatus("CONNECTED");
+        reconnectDelay = 2500;
+        setConnection("CONNECTED");
         setError("");
 
         ws.send(
@@ -302,70 +316,50 @@ export default function Home() {
       ws.onmessage = (event) => {
         if (stoppedRef.current) return;
 
-        setReceived((count) => count + 1);
-
         let message: any;
 
         try {
           message = JSON.parse(event.data);
         } catch {
-          setError("Could not read the Deriv response.");
+          setError("Invalid response received from Deriv.");
           return;
         }
 
         if (message.error) {
-          setError(
-            message.error.message ||
-              message.error.code ||
-              "Deriv API error."
-          );
+          setError(message.error.message || "Deriv API error.");
           return;
         }
 
         if (Array.isArray(message.active_symbols)) {
-          const active = message.active_symbols
-            .map((item: any) => ({
-              symbol: item.symbol || item.underlying_symbol,
-              pip: Number(item.pip_size ?? item.pip ?? 0.01) || 0.01,
-            }))
-            .filter((item: any) =>
-              MARKETS.some((market) => market.symbol === item.symbol)
-            );
+          const available = message.active_symbols.filter(
+            (item: any) =>
+              MARKETS.some(
+                (market) => market.symbol === item.symbol
+              )
+          );
 
-          if (active.length === 0) {
-            setError("Deriv did not return any of the requested markets.");
-            return;
-          }
+          available.forEach((item: any, index: number) => {
+            const symbol = item.symbol;
+            const pip = Number(item.pip_size) || 0.01;
 
-          setMarkets((previous) => {
-            const next = { ...previous };
+            pipRef.current[symbol] = pip;
 
-            active.forEach((item: any) => {
-              next[item.symbol] = {
-                ...next[item.symbol],
-                pipSize: item.pip,
-                status: "SUBSCRIBING",
-              };
-            });
-
-            return next;
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  ticks: symbol,
+                  subscribe: 1,
+                  req_id: 100 + index,
+                })
+              );
+            }
           });
 
-          active.forEach((item: any, index: number) => {
-            if (ws.readyState !== WebSocket.OPEN) return;
-
-            ws.send(
-              JSON.stringify({
-                ticks: item.symbol,
-                subscribe: 1,
-                req_id: 100 + index,
-              })
-            );
-          });
-
-          if (active.length !== MARKETS.length) {
+          if (available.length === 0) {
+            setError("No requested synthetic markets were returned.");
+          } else if (available.length < MARKETS.length) {
             setError(
-              `Deriv returned ${active.length} of ${MARKETS.length} requested markets.`
+              `Deriv returned ${available.length} of ${MARKETS.length} requested markets.`
             );
           }
 
@@ -374,66 +368,56 @@ export default function Home() {
 
         if (message.tick?.symbol) {
           const symbol = message.tick.symbol;
-          const quote = Number(message.tick.quote);
 
           if (
-            !Number.isFinite(quote) ||
-            !MARKETS.some((market) => market.symbol === symbol) ||
-            !scannerRef.current
+            !scannerRef.current ||
+            !MARKETS.some((market) => market.symbol === symbol)
           ) {
             return;
           }
 
-          const oldMarket =
-            marketsRef.current[symbol] || blankMarket();
+          const quote = Number(message.tick.quote);
+          if (!Number.isFinite(quote)) return;
 
-          const pip =
-            Number(message.tick.pip_size) ||
-            oldMarket.pipSize ||
-            0.01;
+          const pip = pipRef.current[symbol] || 0.01;
 
           const tick: Tick = {
             quote,
-            digit: lastDigit(quote, pip),
+            digit: getDigit(quote, pip),
             time: Number(message.tick.epoch) || Date.now() / 1000,
           };
 
-          setMarkets((previous) => {
-            const current = previous[symbol] || blankMarket();
+          const updated = {
+            ...historyRef.current,
+            [symbol]: [
+              ...(historyRef.current[symbol] || []),
+              tick,
+            ].slice(-MAX_TICKS),
+          };
 
-            return {
-              ...previous,
-              [symbol]: {
-                ...current,
-                ticks: [...current.ticks, tick].slice(-1000),
-                price: quote,
-                pipSize: pip,
-                status: "LIVE",
-              },
-            };
-          });
-
+          historyRef.current = updated;
+          setHistory(updated);
           setError("");
         }
       };
 
       ws.onerror = () => {
         if (!stoppedRef.current) {
-          setStatus("ERROR");
-          setError("WebSocket error. Check your internet connection.");
+          setConnection("ERROR");
+          setError("Connection error. Check your internet connection.");
         }
       };
 
       ws.onclose = (event) => {
         if (stoppedRef.current) return;
 
-        setStatus("DISCONNECTED");
+        setConnection("DISCONNECTED");
         setError(`Connection closed (${event.code}). Reconnecting…`);
 
-        reconnectRef.current = setTimeout(connect, delay);
-        delay = Math.min(delay * 2, 30000);
+        reconnectRef.current = setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
       };
-    };
+    }
 
     connect();
 
@@ -452,90 +436,63 @@ export default function Home() {
         socketRef.current.close();
       }
     };
-  }, []);
+  }, [loaded]);
 
-  const selected = markets[selectedMarket] || blankMarket();
+  const ticks = history[selectedMarket] || [];
+  const latest = ticks[ticks.length - 1];
 
-  const ticks = useMemo(
-    () => selected.ticks.slice(-windowSize),
-    [selected.ticks, windowSize]
+  const prediction = useMemo(
+    () => makePrediction(ticks, contract),
+    [ticks, contract]
   );
 
+  const testResults = useMemo(
+    () => getWalkForwardResults(ticks, contract),
+    [ticks, contract]
+  );
+
+  const wins = testResults.filter((result) => result.correct).length;
+  const losses = testResults.length - wins;
+  const accuracy =
+    testResults.length > 0
+      ? (wins / testResults.length) * 100
+      : 0;
+
   const digitCounts = useMemo(
-    () =>
-      Array.from({ length: 10 }, (_, digit) =>
-        ticks.filter((tick) => tick.digit === digit).length
-      ),
+    () => countDigits(ticks.slice(-500)),
     [ticks]
   );
 
-  const last = ticks[ticks.length - 1];
-
-  const candidates = useMemo(
-    () => buildCandidates(ticks, target),
-    [ticks, target]
-  );
-
-  function analyseNow() {
-    if (ticks.length < 100) {
-      setAnalysis(null);
-      setAnalysisMessage(
-        `NO CONFIDENT SIGNAL — only ${ticks.length} ticks collected. At least 100 are needed for an initial screen.`
-      );
-      return;
-    }
-
-    const best = candidates[0];
-
-    if (
-      !best ||
-      best.edge < 3 ||
-      best.recentRate < best.baseline + 1
-    ) {
-      setAnalysis(null);
-      setAnalysisMessage(
-        "NO CONFIDENT SIGNAL — the historical sample does not show a sufficiently consistent difference from baseline."
-      );
-      return;
-    }
-
-    setAnalysis(best);
-    setAnalysisMessage(
-      "A statistical candidate was found for review. It is not a prediction guarantee or a trade instruction."
-    );
-  }
-
-  const panel: CSSProperties = {
-    background: "#151d30",
-    border: "1px solid #293a58",
-    borderRadius: 14,
-    padding: 16,
-    marginBottom: 14,
-  };
-
-  const muted: CSSProperties = {
-    color: "#a9bad2",
-    fontSize: 13,
-  };
-
-  const selectStyle: CSSProperties = {
-    width: "100%",
-    padding: 12,
-    marginTop: 6,
-    borderRadius: 8,
-    background: "#0c1526",
-    color: "white",
-    border: "1px solid #405575",
-  };
-
-  const button: CSSProperties = {
-    padding: "11px 14px",
-    borderRadius: 9,
-    border: "1px solid #496487",
-    background: "#263b5d",
-    color: "white",
-    fontWeight: 700,
-    cursor: "pointer",
+  const styles = {
+    panel: {
+      background: "#151d30",
+      border: "1px solid #293a58",
+      borderRadius: 14,
+      padding: 16,
+      marginBottom: 14,
+    } as React.CSSProperties,
+    muted: {
+      color: "#a9bad2",
+      fontSize: 13,
+    } as React.CSSProperties,
+    select: {
+      width: "100%",
+      padding: 12,
+      marginTop: 7,
+      borderRadius: 8,
+      background: "#0c1526",
+      color: "white",
+      border: "1px solid #405575",
+    } as React.CSSProperties,
+    button: {
+      padding: "12px 15px",
+      borderRadius: 9,
+      border: "1px solid #496487",
+      background: "#263b5d",
+      color: "white",
+      fontWeight: 700,
+      cursor: "pointer",
+    } as React.CSSProperties,
   };
 
   return (
@@ -551,64 +508,37 @@ export default function Home() {
       }}
     >
       <header style={{ marginBottom: 20 }}>
-        <div
-          style={{
-            color: "#55d6be",
-            fontSize: 12,
-            fontWeight: 800,
-          }}
-        >
-          HOPE AI • DERIV ANALYZER PRO V2.40
+        <div style={{ color: "#55d6be", fontSize: 12, fontWeight: 800 }}>
+          HOPE AI • DERIV ANALYZER PRO V2.42
         </div>
-
-        <h1 style={{ fontSize: 27, margin: "8px 0" }}>
+        <h1 style={{ fontSize: 26, margin: "8px 0" }}>
           HOPE AI DERIV ANALYZER PRO
         </h1>
-
-        <p style={muted}>
-          Live synthetic-market monitoring and statistical signal screening
+        <p style={styles.muted}>
+          Live synthetic market scanner · Automatic digit selection · Historical testing
         </p>
       </header>
 
-      <section style={panel}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          PUBLIC MARKET CONNECTION
-        </h2>
-
-        <strong
-          style={{
-            color: status === "CONNECTED" ? "#36d399" : "#ffc66d",
-          }}
-        >
-          ● {status}
+      <section style={styles.panel}>
+        <h2>CONNECTION</h2>
+        <strong style={{
+          color: connection === "CONNECTED" ? "#36d399" : "#ffc66d",
+        }}>
+          ● {connection}
         </strong>
-
-        <p style={muted}>
-          Messages received: {received} · Public prices only · No account token used
+        <p style={styles.muted}>
+          Public market feed. This connection does not access your Deriv account.
         </p>
-
-        {error && (
-          <p style={{ color: "#ff9292", fontSize: 13 }}>{error}</p>
-        )}
-
-        <p style={muted}>
-          This connection does not access your balance or place trades.
-        </p>
+        {error && <p style={{ color: "#ff9292" }}>{error}</p>}
       </section>
 
-      <section style={panel}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>MARKET SELECTOR</h2>
-
-        <label style={muted}>Choose one of the 10 synthetic markets</label>
-
+      <section style={styles.panel}>
+        <h2>MARKET SELECTOR</h2>
+        <label style={styles.muted}>Choose your market</label>
         <select
-          style={selectStyle}
+          style={styles.select}
           value={selectedMarket}
-          onChange={(event) => {
-            setSelectedMarket(event.target.value);
-            setAnalysis(null);
-            setAnalysisMessage("Market changed. Collect ticks and analyse again.");
-          }}
+          onChange={(event) => setSelectedMarket(event.target.value)}
         >
           {MARKETS.map((market) => (
             <option key={market.symbol} value={market.symbol}>
@@ -617,193 +547,175 @@ export default function Home() {
           ))}
         </select>
 
-        <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
+        <div style={{
+          display: "flex",
+          gap: 12,
+          marginTop: 18,
+          flexWrap: "wrap",
+        }}>
           <div style={{ flex: 1 }}>
-            <div style={muted}>Latest price</div>
-            <strong>{selected.price ?? "--"}</strong>
+            <div style={styles.muted}>Latest price</div>
+            <strong>{latest?.quote ?? "--"}</strong>
           </div>
-
           <div style={{ flex: 1 }}>
-            <div style={muted}>Last digit</div>
+            <div style={styles.muted}>Last digit</div>
             <strong style={{ color: "#55d6be", fontSize: 24 }}>
-              {last?.digit ?? "--"}
+              {latest?.digit ?? "--"}
             </strong>
           </div>
-
           <div style={{ flex: 1 }}>
-            <div style={muted}>Ticks in window</div>
-            <strong>{ticks.length}</strong>
+            <div style={styles.muted}>Saved ticks</div>
+            <strong>{ticks.length.toLocaleString()}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section style={styles.panel}>
+        <h2>CHOOSE CONTRACT TYPE</h2>
+        <p style={styles.muted}>
+          You choose the contract. Hope AI selects the digit or direction.
+        </p>
+        <select
+          style={styles.select}
+          value={contract}
+          onChange={(event) =>
+            setContract(event.target.value as Contract)
+          }
+        >
+          <option value="MATCHES">Matches</option>
+          <option value="DIFFERS">Differs</option>
+          <option value="EVEN">Even</option>
+          <option value="ODD">Odd</option>
+          <option value="RISE">Rise</option>
+          <option value="FALL">Fall</option>
+        </select>
+      </section>
+
+      <section style={styles.panel}>
+        <h2>AI ANALYSIS</h2>
+
+        {ticks.length < TRAINING_TICKS ? (
+          <>
+            <h3 style={{ color: "#ffc66d" }}>COLLECTING DATA</h3>
+            <p>
+              {ticks.length} / {TRAINING_TICKS} minimum training ticks
+            </p>
+            <p style={styles.muted}>
+              The analyzer needs more market history before selecting a candidate.
+            </p>
+          </>
+        ) : prediction ? (
+          <>
+            <div style={{ color: "#55d6be", fontWeight: 800 }}>
+              HISTORICAL CANDIDATE
+            </div>
+            <h2 style={{ fontSize: 28, margin: "12px 0" }}>
+              {prediction.expected}
+            </h2>
+            <p style={styles.muted}>{prediction.reason}</p>
+            <p style={styles.muted}>
+              Contract selected: {contract}
+            </p>
+            <p style={{ color: "#ffc66d", fontSize: 13 }}>
+              This is a historical-statistics candidate, not a guaranteed next-tick prediction.
+            </p>
+          </>
+        ) : null}
+      </section>
+
+      <section style={styles.panel}>
+        <h2>WALK-FORWARD TEST RESULTS</h2>
+        <p style={styles.muted}>
+          The analyzer uses earlier ticks to make each historical candidate,
+          then checks it against the next observed tick.
+        </p>
+
+        <div style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: 18,
+          marginTop: 14,
+        }}>
+          <div>
+            <div style={styles.muted}>Tested signals</div>
+            <strong style={{ fontSize: 23 }}>
+              {testResults.length}
+            </strong>
+          </div>
+          <div>
+            <div style={styles.muted}>Correct</div>
+            <strong style={{ color: "#36d399", fontSize: 23 }}>
+              {wins}
+            </strong>
+          </div>
+          <div>
+            <div style={styles.muted}>Incorrect</div>
+            <strong style={{ color: "#ff9292", fontSize: 23 }}>
+              {losses}
+            </strong>
+          </div>
+          <div>
+            <div style={styles.muted}>Historical accuracy</div>
+            <strong style={{ fontSize: 23 }}>
+              {testResults.length ? `${accuracy.toFixed(1)}%` : "--"}
+            </strong>
           </div>
         </div>
 
-        <p style={muted}>
-          Market feed: {selected.status}. Up to 1,000 ticks are stored per market during this session.
+        <p style={styles.muted}>
+          Results are historical only. They do not establish the probability
+          of winning the next trade. Testing is based on the current phone's
+          saved tick history.
         </p>
+
+        {testResults.length < 100 && (
+          <p style={{ color: "#ffc66d", fontSize: 13 }}>
+            Collect more data before treating the test results as meaningful.
+          </p>
+        )}
       </section>
 
-      <section style={panel}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>ANALYSIS SETTINGS</h2>
-
-        <label style={muted}>Historical window</label>
-
-        <select
-          style={selectStyle}
-          value={windowSize}
-          onChange={(event) => {
-            setWindowSize(Number(event.target.value));
-            setAnalysis(null);
-          }}
-        >
-          {[100, 500, 1000].map((size) => (
-            <option key={size} value={size}>
-              Last {size} ticks
-            </option>
-          ))}
-        </select>
-
-        <label
-          style={{ ...muted, display: "block", marginTop: 14 }}
-        >
-          Target digit for Matches/Differs
-        </label>
-
-        <select
-          style={selectStyle}
-          value={target}
-          onChange={(event) => setTarget(Number(event.target.value))}
-        >
-          {Array.from({ length: 10 }, (_, digit) => (
-            <option key={digit} value={digit}>
-              Digit {digit}
-            </option>
-          ))}
-        </select>
-
-        <p style={muted}>
-          Supported contracts: Matches, Differs, Even, Odd, Rise and Fall.
-          Over/Under and barrier controls have been removed.
-        </p>
-      </section>
-
-      <section style={panel}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          DIGIT DISTRIBUTION
-        </h2>
-
+      <section style={styles.panel}>
+        <h2>DIGIT DISTRIBUTION</h2>
         {digitCounts.map((count, digit) => {
-          const value = percentage(count, ticks.length);
+          const rate =
+            ticks.length > 0
+              ? (count / Math.min(ticks.length, 500)) * 100
+              : 0;
 
           return (
             <div key={digit} style={{ marginBottom: 11 }}>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  fontSize: 13,
-                  marginBottom: 4,
-                }}
-              >
+              <div style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontSize: 13,
+                marginBottom: 4,
+              }}>
                 <span>Digit {digit}</span>
-                <span>
-                  {value.toFixed(1)}% ({count})
-                </span>
+                <span>{rate.toFixed(1)}% · {count}</span>
               </div>
-
-              <div
-                style={{
-                  height: 8,
-                  borderRadius: 20,
-                  background: "#293750",
-                  overflow: "hidden",
-                }}
-              >
-                <div
-                  style={{
-                    width: `${value}%`,
-                    height: "100%",
-                    background: "#55d6be",
-                  }}
-                />
+              <div style={{
+                height: 8,
+                background: "#293750",
+                borderRadius: 20,
+                overflow: "hidden",
+              }}>
+                <div style={{
+                  width: `${rate}%`,
+                  height: "100%",
+                  background: "#55d6be",
+                }} />
               </div>
             </div>
           );
         })}
       </section>
 
-      <section style={panel}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          SIGNAL ANALYSIS ENGINE
-        </h2>
-
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button style={button} onClick={analyseNow}>
-            ANALYSE NOW
-          </button>
-
-          <button
-            style={button}
-            onClick={() => setScannerOn((value) => !value)}
-          >
-            {scannerOn ? "PAUSE SCANNER" : "RESUME SCANNER"}
-          </button>
-        </div>
-
-        <p
-          style={{
-            marginTop: 18,
-            color: analysis ? "#55d6be" : "#ffc66d",
-            fontWeight: 800,
-          }}
-        >
-          {analysis ? "CANDIDATE FOR REVIEW" : "SIGNAL STATUS"}
-        </p>
-
-        <p>{analysisMessage}</p>
-
-        {analysis && (
-          <div
-            style={{
-              background: "#0c1526",
-              borderRadius: 10,
-              padding: 12,
-              marginTop: 10,
-            }}
-          >
-            <strong style={{ fontSize: 20 }}>{analysis.label}</strong>
-
-            <p style={muted}>
-              Full-window historical rate: {analysis.sampleRate.toFixed(1)}%
-            </p>
-
-            <p style={muted}>
-              Recent 100-tick rate: {analysis.recentRate.toFixed(1)}%
-            </p>
-
-            <p style={muted}>
-              Difference from baseline: {analysis.edge.toFixed(1)} percentage points
-            </p>
-
-            <p style={{ color: "#ffc66d", fontSize: 13 }}>
-              This is a statistical screening result, not a true next-tick probability or a trade instruction.
-            </p>
-          </div>
-        )}
-
-        <p style={muted}>
-          The engine compares the selected Matches/Differs digit, Even/Odd,
-          and Rise/Fall. It requires at least 100 ticks and a historical
-          difference from baseline. This screening method is experimental
-          and has not yet been validated on unseen data.
-        </p>
-      </section>
-
-      <section style={panel}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          ALL MARKETS STATUS
-        </h2>
-
+      <section style={styles.panel}>
+        <h2>ALL MARKET STATUS</h2>
         {MARKETS.map((market) => {
-          const data = markets[market.symbol] || blankMarket();
+          const count = (history[market.symbol] || []).length;
+          const live = market.symbol === selectedMarket && latest;
 
           return (
             <div
@@ -818,54 +730,51 @@ export default function Home() {
               }}
             >
               <span>{market.name}</span>
-
-              <span
-                style={{
-                  color: data.status === "LIVE" ? "#36d399" : "#ffc66d",
-                }}
-              >
-                {data.status === "LIVE" ? data.price : data.status}
+              <span style={{ color: live ? "#36d399" : "#a9bad2" }}>
+                {live ? `LIVE · ${count} ticks` : `${count} saved ticks`}
               </span>
             </div>
           );
         })}
       </section>
 
-      <section style={panel}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          ACCOUNT & MANUAL TRADE APPROVAL
-        </h2>
-
-        <strong style={{ color: "#ffc66d" }}>
-          ACCOUNT NOT CONNECTED
-        </strong>
-
-        <p style={muted}>
-          This version is a public market scanner and analysis tool.
-          OAuth account connection, demo trade proposals, and a separate
-          approval step still need to be implemented and tested securely.
-        </p>
-
+      <section style={styles.panel}>
+        <h2>SCANNER CONTROLS</h2>
         <button
-          style={{
-            ...button,
-            width: "100%",
-            opacity: 0.55,
-            cursor: "not-allowed",
-          }}
-          disabled
+          style={styles.button}
+          onClick={() => setScannerOn((value) => !value)}
         >
-          DEMO TRADE — NOT CONNECTED
+          {scannerOn ? "PAUSE TICK COLLECTION" : "RESUME TICK COLLECTION"}
         </button>
-
-        <p style={{ color: "#ffc66d", fontSize: 13 }}>
-          No trades are placed by this page. Never paste your Deriv access
-          token into browser code.
+        <p style={styles.muted}>
+          Pausing stops new ticks from being added. Previously saved history remains on this phone.
+        </p>
+        <p style={styles.muted}>
+          History is stored in this browser's local storage. Clearing browser
+          data or changing devices can remove it.
         </p>
       </section>
 
-      <footer style={{ ...muted, textAlign: "center" }}>
-        HOPE AI DERIV ANALYZER PRO · PUBLIC MARKET DATA BUILD
+      <section style={styles.panel}>
+        <h2>ACCOUNT & TRADE EXECUTION</h2>
+        <strong style={{ color: "#ffc66d" }}>
+          DERIV ACCOUNT NOT CONNECTED
+        </strong>
+        <p style={styles.muted}>
+          This version analyses public market data only. OAuth login,
+          demo trade proposals, and manual trade approval are not yet connected.
+        </p>
+        <p style={{ color: "#ffc66d", fontSize: 13 }}>
+          No trades are placed. Never paste your access token into this page.
+        </p>
+      </section>
+
+      <footer style={{
+        ...styles.muted,
+        textAlign: "center",
+        paddingBottom: 20,
+      }}>
+        HOPE AI DERIV ANALYZER PRO V2.42
       </footer>
     </main>
   );
