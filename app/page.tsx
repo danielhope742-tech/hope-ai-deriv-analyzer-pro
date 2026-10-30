@@ -330,41 +330,42 @@ export default function Home() {
           return;
         }
 
-        if (Array.isArray(message.active_symbols)) {
-          const available = message.active_symbols.filter(
-            (item: any) =>
-              MARKETS.some(
-                (market) => market.symbol === item.symbol
-              )
-          );
 
-          available.forEach((item: any, index: number) => {
-            const symbol = item.symbol;
-            const pip = Number(item.pip_size) || 0.01;
+if (Array.isArray(message.active_symbols)) {
+  const available = message.active_symbols
+    .map((item: any) => ({
+      symbol: item.underlying_symbol || item.symbol,
+      pip: Number(item.pip_size ?? item.pip) || 0.01,
+    }))
+    .filter((item: any) =>
+      MARKETS.some((market) => market.symbol === item.symbol)
+    );
 
-            pipRef.current[symbol] = pip;
+  available.forEach((item: any, index: number) => {
+    pipRef.current[item.symbol] = item.pip;
 
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(
-                JSON.stringify({
-                  ticks: symbol,
-                  subscribe: 1,
-                  req_id: 100 + index,
-                })
-              );
-            }
-          });
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          ticks: item.symbol,
+          subscribe: 1,
+          req_id: 100 + index,
+        })
+      );
+    }
+  });
 
-          if (available.length === 0) {
-            setError("No requested synthetic markets were returned.");
-          } else if (available.length < MARKETS.length) {
-            setError(
-              `Deriv returned ${available.length} of ${MARKETS.length} requested markets.`
-            );
-          }
+  if (available.length === 0) {
+    setError(
+      "No matching markets found. Check the active_symbols response."
+    );
+  } else {
+    setError("");
+  }
 
-          return;
-        }
+  return;
+}
+
 
         if (message.tick?.symbol) {
           const symbol = message.tick.symbol;
