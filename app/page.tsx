@@ -35,23 +35,23 @@ type MarketData = {
   pipSize: number;
 };
 
-type ConnectionStatus =
-  | "CONNECTING"
-  | "CONNECTED"
-  | "ERROR"
-  | "CLOSED";
+type ActiveSymbol = {
+  symbol?: string;
+  underlying_symbol?: string;
+  display_name?: string;
+  underlying_symbol_name?: string;
+  pip?: number;
+  pip_size?: number;
+};
 
 type ApiMessage = {
   msg_type?: string;
+  req_id?: number;
   error?: {
     message?: string;
     code?: string;
   };
-  active_symbols?: Array<{
-    symbol?: string;
-    display_name?: string;
-    pip?: number;
-  }>;
+  active_symbols?: ActiveSymbol[];
   tick?: {
     symbol?: string;
     quote?: number | string;
@@ -60,24 +60,19 @@ type ApiMessage = {
   };
 };
 
+type ConnectionStatus =
+  | "CONNECTING"
+  | "CONNECTED"
+  | "ERROR"
+  | "CLOSED";
+
 function emptyMarket(): MarketData {
   return {
     ticks: [],
     price: null,
     status: "WAITING",
-    pipSize: 2,
+    pipSize: 0.01,
   };
-}
-
-function getLastDigit(quote: number, pipSize: number): number {
-  const decimals = Math.max(0, Math.min(10, pipSize));
-  const fixed = quote.toFixed(decimals);
-  return Number(fixed.charAt(fixed.length - 1));
-}
-
-function percentage(count: number, total: number): string {
-  if (!total) return "0.0";
-  return ((count / total) * 100).toFixed(1);
 }
 
 function makeInitialMarkets(): Record<string, MarketData> {
@@ -88,6 +83,49 @@ function makeInitialMarkets(): Record<string, MarketData> {
   });
 
   return initial;
+}
+
+/**
+ * Deriv's newer active-symbol response can provide pip_size
+ * as a price increment, such as 0.01 or 0.001.
+ *
+ * Some other responses provide the number of decimal places.
+ * This function supports both formats.
+ */
+function getDecimalPlaces(pipSize: number): number {
+  if (!Number.isFinite(pipSize) || pipSize <= 0) {
+    return 2;
+  }
+
+  if (pipSize < 1) {
+    const text = pipSize.toString();
+
+    if (text.includes("e-")) {
+      const exponent = Number(text.split("e-")[1]);
+      return Math.max(0, Math.min(10, exponent));
+    }
+
+    const decimalPart = text.split(".")[1] || "";
+    return Math.max(0, Math.min(10, decimalPart.length));
+  }
+
+  return Math.max(0, Math.min(10, Math.round(pipSize)));
+}
+
+function getLastDigit(
+  quote: number,
+  pipSize: number
+): number {
+  const decimals = getDecimalPlaces(pipSize);
+  const fixed = quote.toFixed(decimals);
+  const digitsOnly = fixed.replace(".", "");
+
+  return Number(digitsOnly.charAt(digitsOnly.length - 1));
+}
+
+function percentage(count: number, total: number): string {
+  if (!total) return "0.0";
+  return ((count / total) * 100).toFixed(1);
 }
 
 export default function Home() {
@@ -111,9 +149,9 @@ export default function Home() {
   const [rawResponse, setRawResponse] = useState("");
 
   const socketRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null
-  );
+  const reconnectTimerRef =
+    useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const reconnectDelayRef = useRef(3000);
   const activeRef = useRef(true);
   const scannerActiveRef = useRef(true);
@@ -123,7 +161,7 @@ export default function Home() {
     scannerActiveRef.current = scannerActive;
   }, [scannerActive]);
 
-  // PUBLIC DERIV MARKET DATA CONNECTION
+  // DERIV PUBLIC MARKET DATA CONNECTION
 
   useEffect(() => {
     activeRef.current = true;
@@ -142,18 +180,33 @@ export default function Home() {
         socketRef.current = socket;
       } catch (error) {
         setConnectionStatus("ERROR");
+
         setConnectionError(
           error instanceof Error
             ? error.message
-            : "Could not create WebSocket"
+            : "Could not create WebSocket connection."
         );
+
+        scheduleReconnect();
+        return;
+      }
+
+      function scheduleReconnect() {
+        if (!activeRef.current) return;
+
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current);
+        }
 
         reconnectTimerRef.current = setTimeout(
           connect,
           reconnectDelayRef.current
         );
 
-        return;
+        reconnectDelayRef.current = Math.min(
+          reconnectDelayRef.current * 2,
+          30000
+        );
       }
 
       socket.onopen = () => {
@@ -163,6 +216,7 @@ export default function Home() {
         setConnectionStatus("CONNECTED");
         setConnectionError("");
 
+        // Request available synthetic markets.
         socket.send(
           JSON.stringify({
             active_symbols: "brief",
@@ -185,55 +239,97 @@ export default function Home() {
 
         let data: ApiMessage;
 
-        // Corrected JSON parsing and debug logging.
         try {
           data = JSON.parse(event.data);
-          setRawResponse(JSON.stringify(data, null, 2).slice(0, 2000));
-          console.log("DERIV RAW RESPONSE:", data);
+
+          setRawResponse(
+            JSON.stringify(data, null, 2).slice(0, 5000)
+          );
         } catch {
           setConnectionError(
-            "Could not read the market-data response."
+            "The Deriv response could not be read as JSON."
           );
           return;
         }
 
+        // Display API errors.
         if (data.error) {
           const message =
             data.error.message ||
             data.error.code ||
-            "Deriv API error";
+            "Deriv API error.";
 
           setConnectionError(message);
           return;
         }
 
-        // Read available symbols.
-        if (
-          data.msg_type === "active_symbols" &&
-          Array.isArray(data.active_symbols)
-        ) {
-          const returnedSymbols = data.active_symbols
-            .map((item) => item.symbol)
+        // HANDLE ACTIVE SYMBOLS.
+        // Important: support both symbol and underlying_symbol.
+
+        if (Array.isArray(data.active_symbols)) {
+          const returnedMarkets = data.active_symbols
+            .map((item) => {
+              const symbol =
+                item.symbol || item.underlying_symbol;
+
+              return {
+                symbol,
+                pipSize:
+                  item.pip_size ??
+                  item.pip ??
+                  0.01,
+              };
+            })
             .filter(
-              (symbol): symbol is string => Boolean(symbol)
+              (item): item is {
+                symbol: string;
+                pipSize: number;
+              } => Boolean(item.symbol)
             );
 
-          const wantedSymbols = MARKETS
-            .map((market) => market.symbol)
-            .filter((symbol) =>
-              returnedSymbols.includes(symbol)
-            );
+          const returnedSymbols = returnedMarkets.map(
+            (item) => item.symbol
+          );
+
+          const wantedMarkets = returnedMarkets.filter(
+            (item) =>
+              MARKETS.some(
+                (market) => market.symbol === item.symbol
+              )
+          );
+
+          const wantedSymbols = wantedMarkets.map(
+            (item) => item.symbol
+          );
 
           setAvailableSymbols(wantedSymbols);
 
-          if (wantedSymbols.length === 0) {
+          if (wantedMarkets.length === 0) {
             setConnectionError(
-              "No requested markets were returned. See the API response below."
+              "Deriv returned markets, but none matched the selected market list. Check the API response."
             );
             return;
           }
 
-          wantedSymbols.forEach((symbol, index) => {
+          // Save each market's price precision.
+          setMarkets((previous) => {
+            const updated = { ...previous };
+
+            wantedMarkets.forEach((item) => {
+              updated[item.symbol] = {
+                ...updated[item.symbol],
+                pipSize: Number(item.pipSize) || 0.01,
+                status: "SUBSCRIBING",
+              };
+            });
+
+            return updated;
+          });
+
+          // Subscribe to each available market.
+          wantedMarkets.forEach((item, index) => {
+            const symbol = item.symbol;
+
             if (
               socket.readyState !== WebSocket.OPEN ||
               subscribedRef.current.has(symbol)
@@ -250,29 +346,29 @@ export default function Home() {
                 req_id: 100 + index,
               })
             );
-
-            setMarkets((previous) => ({
-              ...previous,
-              [symbol]: {
-                ...previous[symbol],
-                status: "SUBSCRIBING",
-              },
-            }));
           });
+
+          if (wantedSymbols.length < MARKETS.length) {
+            setConnectionError(
+              `Found ${wantedSymbols.length} of ${MARKETS.length} requested markets. Some requested symbols were not returned by Deriv.`
+            );
+          }
 
           return;
         }
 
-        // Receive live tick data.
-        if (data.msg_type === "tick" && data.tick) {
+        // HANDLE LIVE TICKS.
+        // Do not depend only on msg_type; use the tick object too.
+
+        if (data.tick) {
           const symbol = data.tick.symbol;
           const quote = Number(data.tick.quote);
-          const epoch = Number(data.tick.epoch);
-          const pipSize = Number(data.tick.pip_size ?? 2);
 
           if (
             !symbol ||
-            !MARKETS.some((market) => market.symbol === symbol) ||
+            !MARKETS.some(
+              (market) => market.symbol === symbol
+            ) ||
             !Number.isFinite(quote)
           ) {
             return;
@@ -280,10 +376,17 @@ export default function Home() {
 
           if (!scannerActiveRef.current) return;
 
-          const digit = getLastDigit(
-            quote,
-            Number.isFinite(pipSize) ? pipSize : 2
-          );
+          const existingMarket =
+            marketsRef.current[symbol] || emptyMarket();
+
+          const pipSize =
+            Number(data.tick.pip_size) ||
+            existingMarket.pipSize ||
+            0.01;
+
+          const digit = getLastDigit(quote, pipSize);
+
+          const epoch = Number(data.tick.epoch);
 
           const tick: Tick = {
             quote,
@@ -308,12 +411,13 @@ export default function Home() {
                 ticks: updatedTicks,
                 price: quote,
                 status: "LIVE",
-                pipSize: Number.isFinite(pipSize)
-                  ? pipSize
-                  : oldMarket.pipSize,
+                pipSize,
               },
             };
           });
+
+          setConnectionError("");
+          return;
         }
       };
 
@@ -321,8 +425,9 @@ export default function Home() {
         if (!activeRef.current) return;
 
         setConnectionStatus("ERROR");
+
         setConnectionError(
-          "WebSocket error. Check your internet connection and endpoint response."
+          "WebSocket error. Check your connection and the Deriv endpoint."
         );
       };
 
@@ -330,6 +435,7 @@ export default function Home() {
         if (!activeRef.current) return;
 
         setConnectionStatus("CLOSED");
+
         setConnectionError(
           `Connection closed. Code: ${event.code}. ${
             event.reason || "No close reason supplied."
@@ -349,15 +455,7 @@ export default function Home() {
           return updated;
         });
 
-        reconnectTimerRef.current = setTimeout(
-          connect,
-          reconnectDelayRef.current
-        );
-
-        reconnectDelayRef.current = Math.min(
-          reconnectDelayRef.current * 2,
-          30000
-        );
+        scheduleReconnect();
       };
     };
 
@@ -383,6 +481,13 @@ export default function Home() {
       socketRef.current = null;
     };
   }, []);
+
+  // Keep a current reference to market state for WebSocket callbacks.
+  const marketsRef = useRef(markets);
+
+  useEffect(() => {
+    marketsRef.current = markets;
+  }, [markets]);
 
   // SELECTED MARKET ANALYSIS
 
@@ -435,6 +540,7 @@ export default function Home() {
   const previousTick = ticks[ticks.length - 2];
 
   const lastDigit = lastTick ? lastTick.digit : null;
+
   const previousDigit = previousTick
     ? previousTick.digit
     : null;
@@ -468,21 +574,45 @@ export default function Home() {
   const selectedPercentage = (() => {
     switch (contract) {
       case "MATCHES":
-        return Number(percentage(matchCount, totalTicks));
+        return Number(
+          percentage(matchCount, totalTicks)
+        );
+
       case "DIFFERS":
-        return Number(percentage(differCount, totalTicks));
+        return Number(
+          percentage(differCount, totalTicks)
+        );
+
       case "EVEN":
-        return Number(percentage(evenCount, totalTicks));
+        return Number(
+          percentage(evenCount, totalTicks)
+        );
+
       case "ODD":
-        return Number(percentage(oddCount, totalTicks));
+        return Number(
+          percentage(oddCount, totalTicks)
+        );
+
       case "OVER":
-        return Number(percentage(overCount, totalTicks));
+        return Number(
+          percentage(overCount, totalTicks)
+        );
+
       case "UNDER":
-        return Number(percentage(underCount, totalTicks));
+        return Number(
+          percentage(underCount, totalTicks)
+        );
+
       case "RISE":
-        return Number(percentage(riseCount, directionTotal));
+        return Number(
+          percentage(riseCount, directionTotal)
+        );
+
       case "FALL":
-        return Number(percentage(fallCount, directionTotal));
+        return Number(
+          percentage(fallCount, directionTotal)
+        );
+
       default:
         return 0;
     }
@@ -601,7 +731,7 @@ export default function Home() {
         </div>
 
         <p style={mutedStyle}>
-          Public market-data endpoint. No legacy App ID 1089.
+          Public market-data connection. No legacy App ID 1089.
         </p>
 
         <p style={mutedStyle}>
@@ -620,9 +750,15 @@ export default function Home() {
 
         {rawResponse && (
           <details style={{ marginTop: 12 }}>
-            <summary style={{ cursor: "pointer", color: "#55d6be" }}>
+            <summary
+              style={{
+                cursor: "pointer",
+                color: "#55d6be",
+              }}
+            >
               View Deriv API response
             </summary>
+
             <pre
               style={{
                 whiteSpace: "pre-wrap",
@@ -654,45 +790,76 @@ export default function Home() {
           MARKET SELECTOR
         </h2>
 
-        <label style={mutedStyle}>Choose synthetic market</label>
+        <label style={mutedStyle}>
+          Choose synthetic market
+        </label>
 
         <select
           style={selectStyle}
           value={selectedMarket}
-          onChange={(event) => setSelectedMarket(event.target.value)}
+          onChange={(event) =>
+            setSelectedMarket(event.target.value)
+          }
         >
           {MARKETS.map((market) => (
-            <option key={market.symbol} value={market.symbol}>
+            <option
+              key={market.symbol}
+              value={market.symbol}
+            >
               {market.name} ({market.symbol})
-              {availableSymbols.includes(market.symbol) ? "" : " — checking"}
+              {availableSymbols.includes(market.symbol)
+                ? ""
+                : " — checking"}
             </option>
           ))}
         </select>
 
-        <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 12,
+            marginTop: 16,
+          }}
+        >
           <div style={{ flex: 1 }}>
             <div style={mutedStyle}>Latest price</div>
+
             <strong style={{ fontSize: 20 }}>
-              {selectedData.price === null ? "--" : selectedData.price}
+              {selectedData.price === null
+                ? "--"
+                : selectedData.price}
             </strong>
           </div>
 
           <div style={{ flex: 1 }}>
             <div style={mutedStyle}>Latest digit</div>
-            <strong style={{ fontSize: 25, color: "#55d6be" }}>
+
+            <strong
+              style={{
+                fontSize: 25,
+                color: "#55d6be",
+              }}
+            >
               {lastDigit === null ? "--" : lastDigit}
             </strong>
           </div>
 
           <div style={{ flex: 1 }}>
             <div style={mutedStyle}>Ticks collected</div>
-            <strong style={{ fontSize: 20 }}>{totalTicks}</strong>
+
+            <strong style={{ fontSize: 20 }}>
+              {totalTicks}
+            </strong>
           </div>
         </div>
 
         <p style={mutedStyle}>
           Market status:{" "}
-          <span style={{ color: statusColor(selectedData.status) }}>
+          <span
+            style={{
+              color: statusColor(selectedData.status),
+            }}
+          >
             {selectedData.status}
           </span>
         </p>
@@ -705,12 +872,16 @@ export default function Home() {
           ANALYSIS WINDOW
         </h2>
 
-        <label style={mutedStyle}>Number of recent ticks</label>
+        <label style={mutedStyle}>
+          Number of recent ticks
+        </label>
 
         <select
           style={selectStyle}
           value={windowSize}
-          onChange={(event) => setWindowSize(Number(event.target.value))}
+          onChange={(event) =>
+            setWindowSize(Number(event.target.value))
+          }
         >
           {WINDOW_SIZES.map((size) => (
             <option key={size} value={size}>
@@ -731,12 +902,16 @@ export default function Home() {
           CONTRACT ANALYSIS
         </h2>
 
-        <label style={mutedStyle}>Choose contract type</label>
+        <label style={mutedStyle}>
+          Choose contract type
+        </label>
 
         <select
           style={selectStyle}
           value={contract}
-          onChange={(event) => setContract(event.target.value)}
+          onChange={(event) =>
+            setContract(event.target.value)
+          }
         >
           <option value="MATCHES">Matches</option>
           <option value="DIFFERS">Differs</option>
@@ -748,36 +923,54 @@ export default function Home() {
           <option value="FALL">Fall</option>
         </select>
 
-        {(contract === "MATCHES" || contract === "DIFFERS") && (
+        {(contract === "MATCHES" ||
+          contract === "DIFFERS") && (
           <>
-            <label style={mutedStyle}>Target digit</label>
+            <label style={mutedStyle}>
+              Target digit
+            </label>
+
             <select
               style={selectStyle}
               value={targetDigit}
-              onChange={(event) => setTargetDigit(Number(event.target.value))}
+              onChange={(event) =>
+                setTargetDigit(Number(event.target.value))
+              }
             >
-              {Array.from({ length: 10 }, (_, digit) => (
-                <option key={digit} value={digit}>
-                  Digit {digit}
-                </option>
-              ))}
+              {Array.from(
+                { length: 10 },
+                (_, digit) => (
+                  <option key={digit} value={digit}>
+                    Digit {digit}
+                  </option>
+                )
+              )}
             </select>
           </>
         )}
 
-        {(contract === "OVER" || contract === "UNDER") && (
+        {(contract === "OVER" ||
+          contract === "UNDER") && (
           <>
-            <label style={mutedStyle}>Barrier digit</label>
+            <label style={mutedStyle}>
+              Barrier digit
+            </label>
+
             <select
               style={selectStyle}
               value={barrierDigit}
-              onChange={(event) => setBarrierDigit(Number(event.target.value))}
+              onChange={(event) =>
+                setBarrierDigit(Number(event.target.value))
+              }
             >
-              {Array.from({ length: 10 }, (_, digit) => (
-                <option key={digit} value={digit}>
-                  {digit}
-                </option>
-              ))}
+              {Array.from(
+                { length: 10 },
+                (_, digit) => (
+                  <option key={digit} value={digit}>
+                    {digit}
+                  </option>
+                )
+              )}
             </select>
           </>
         )}
@@ -787,14 +980,19 @@ export default function Home() {
             Historical frequency in selected window
           </div>
 
-          <strong style={{ fontSize: 30, color: "#55d6be" }}>
+          <strong
+            style={{
+              fontSize: 30,
+              color: "#55d6be",
+            }}
+          >
             {selectedPercentage.toFixed(1)}%
           </strong>
         </div>
 
         <p style={mutedStyle}>
-          This is a historical sample frequency, not the probability of the
-          next result.
+          This is a historical sample frequency, not the probability
+          of the next result.
         </p>
       </section>
 
@@ -806,10 +1004,15 @@ export default function Home() {
         </h2>
 
         {digitCounts.map((count, digit) => {
-          const pct = Number(percentage(count, totalTicks));
+          const pct = Number(
+            percentage(count, totalTicks)
+          );
 
           return (
-            <div key={digit} style={{ marginBottom: 12 }}>
+            <div
+              key={digit}
+              style={{ marginBottom: 12 }}
+            >
               <div
                 style={{
                   display: "flex",
@@ -819,6 +1022,7 @@ export default function Home() {
                 }}
               >
                 <span>Digit {digit}</span>
+
                 <span>
                   {pct.toFixed(1)}% ({count})
                 </span>
@@ -853,45 +1057,82 @@ export default function Home() {
           ANALYSIS ENGINE
         </h2>
 
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button style={buttonStyle} onClick={analyseNow}>
+        <div
+          style={{
+            display: "flex",
+            gap: 10,
+            flexWrap: "wrap",
+          }}
+        >
+          <button
+            style={buttonStyle}
+            onClick={analyseNow}
+          >
             ANALYSE NOW
           </button>
 
           <button
             style={buttonStyle}
-            onClick={() => setScannerActive((value) => !value)}
+            onClick={() =>
+              setScannerActive((value) => !value)
+            }
           >
-            {scannerActive ? "PAUSE SCANNER" : "RESUME SCANNER"}
+            {scannerActive
+              ? "PAUSE SCANNER"
+              : "RESUME SCANNER"}
           </button>
         </div>
 
         <div style={{ marginTop: 18 }}>
-          <div style={mutedStyle}>Analysis status</div>
+          <div style={mutedStyle}>
+            Analysis status
+          </div>
 
-          <strong style={{ fontSize: 19, color: "#55d6be" }}>
+          <strong
+            style={{
+              fontSize: 19,
+              color: "#55d6be",
+            }}
+          >
             {analysisSignal}
           </strong>
         </div>
 
-        <p style={mutedStyle}>Contract: {contract}</p>
+        <p style={mutedStyle}>
+          Contract: {contract}
+        </p>
+
         <p style={mutedStyle}>
           Historical frequency: {selectedPercentage.toFixed(1)}%
         </p>
+
         <p style={mutedStyle}>
-          Latest digit: {lastDigit === null ? "--" : lastDigit}
+          Latest digit:{" "}
+          {lastDigit === null ? "--" : lastDigit}
         </p>
+
         <p style={mutedStyle}>
-          Previous digit: {previousDigit === null ? "--" : previousDigit}
+          Previous digit:{" "}
+          {previousDigit === null ? "--" : previousDigit}
         </p>
-        <p style={mutedStyle}>Latest price direction: {riseFall}</p>
+
+        <p style={mutedStyle}>
+          Latest price direction: {riseFall}
+        </p>
+
         <p style={mutedStyle}>
           Last analysis: {analysisTime || "Not analysed yet"}
         </p>
 
-        <p style={{ color: "#ffc66d", fontSize: 13 }}>
-          Historical frequency does not guarantee the next tick. Use this
-          information for analysis, not as a guaranteed trading signal.
+        <p
+          style={{
+            color: "#ffc66d",
+            fontSize: 13,
+          }}
+        >
+          Historical frequency does not guarantee the next tick.
+          Use this information for analysis, not as a guaranteed
+          trading signal.
         </p>
       </section>
 
@@ -903,7 +1144,8 @@ export default function Home() {
         </h2>
 
         {MARKETS.map((market) => {
-          const data = markets[market.symbol] || emptyMarket();
+          const data =
+            markets[market.symbol] || emptyMarket();
 
           return (
             <div
@@ -927,7 +1169,9 @@ export default function Home() {
                   textAlign: "right",
                 }}
               >
-                {data.status === "LIVE" ? data.price : data.status}
+                {data.status === "LIVE"
+                  ? data.price
+                  : data.status}
               </span>
             </div>
           );
@@ -941,14 +1185,19 @@ export default function Home() {
           DERIV ACCOUNT & TRADE EXECUTION
         </h2>
 
-        <div style={{ color: "#ffc66d", fontWeight: 800 }}>
+        <div
+          style={{
+            color: "#ffc66d",
+            fontWeight: 800,
+          }}
+        >
           ACCOUNT NOT CONNECTED
         </div>
 
         <p style={mutedStyle}>
-          Your public market scanner is separate from your private Deriv
-          account. OAuth account connection and demo trade execution must be
-          configured through secure server routes.
+          Your public market scanner is separate from your private
+          Deriv account. OAuth account connection and demo trade
+          execution must be configured through secure server routes.
         </p>
 
         <button
@@ -963,13 +1212,23 @@ export default function Home() {
           DEMO TRADING — NOT CONNECTED
         </button>
 
-        <p style={{ color: "#ffc66d", fontSize: 13 }}>
-          No real-money trades can be placed by this version. Never put your
-          Deriv access token in this page.
+        <p
+          style={{
+            color: "#ffc66d",
+            fontSize: 13,
+          }}
+        >
+          No real-money trades can be placed by this version.
+          Never put your Deriv access token in this page.
         </p>
       </section>
 
-      <footer style={{ textAlign: "center", ...mutedStyle }}>
+      <footer
+        style={{
+          textAlign: "center",
+          ...mutedStyle,
+        }}
+      >
         HOPE AI DERIV ANALYZER PRO • PUBLIC MARKET DATA BUILD
       </footer>
     </main>
