@@ -21,9 +21,8 @@ type Tick = {
 
 type MarketData = {
   ticks: Tick[];
-  connected: boolean;
   latest: number | null;
-  previous: number | null;
+  connected: boolean;
 };
 
 export default function Home() {
@@ -31,92 +30,158 @@ export default function Home() {
   const [contract, setContract] = useState("Matches");
   const [target, setTarget] = useState("5");
   const [barrier, setBarrier] = useState("5");
-  const [markets, setMarkets] = useState<Record<string, MarketData>>({});
-  const [connection, setConnection] = useState("Connecting...");
-  const [scanning, setScanning] = useState(true);
   const [lookback, setLookback] = useState(100);
 
+  const [markets, setMarkets] = useState<
+    Record<string, MarketData>
+  >({});
+
+  const [connection, setConnection] = useState("CONNECTING");
+  const [connectionError, setConnectionError] = useState("");
+  const [lastUpdate, setLastUpdate] = useState("--");
+  const [scannerActive, setScannerActive] = useState(true);
+
   useEffect(() => {
-    let socket: WebSocket;
+    let socket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout>;
+    let pingTimer: ReturnType<typeof setInterval>;
     let active = true;
+    let reconnectAttempts = 0;
 
     const connect = () => {
       if (!active) return;
 
-      socket = new WebSocket(
-        `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`
-      );
+      setConnection("CONNECTING");
+      setConnectionError("");
 
-      socket.onopen = () => {
-        if (!active) return;
-        setConnection("LIVE");
-        MARKETS.forEach(item => {
-          socket.send(JSON.stringify({
-            ticks: item.symbol,
-            subscribe: 1
-          }));
-        });
-      };
+      try {
+        socket = new WebSocket(
+          `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`
+        );
 
-      socket.onmessage = event => {
-        if (!active) return;
+        socket.onopen = () => {
+          if (!active || !socket) return;
 
-        try {
-          const data = JSON.parse(event.data);
+          reconnectAttempts = 0;
+          setConnection("LIVE");
+          setConnectionError("");
 
-          if (data.error) {
-            setConnection("API error: " + data.error.message);
-            return;
-          }
-
-          if (data.msg_type !== "tick" || !data.tick) return;
-
-          const tick = data.tick;
-          const symbol = tick.symbol;
-          const quote = Number(tick.quote);
-          const precision = Number(tick.pip_size ?? 2);
-          const formatted = quote.toFixed(precision);
-          const digit = Number(formatted.slice(-1));
-
-          setMarkets(previous => {
-            const old = previous[symbol] || {
-              ticks: [],
-              connected: true,
-              latest: null,
-              previous: null
-            };
-
-            const nextTick = {
-              quote,
-              digit,
-              time: Number(tick.epoch)
-            };
-
-            return {
-              ...previous,
-              [symbol]: {
-                ticks: [...old.ticks, nextTick].slice(-1000),
-                connected: true,
-                latest: quote,
-                previous: old.latest
-              }
-            };
+          MARKETS.forEach(item => {
+            socket?.send(JSON.stringify({
+              ticks: item.symbol,
+              subscribe: 1
+            }));
           });
-        } catch {
-          setConnection("Reading market data...");
-        }
-      };
 
-      socket.onerror = () => {
-        if (active) setConnection("Connection error");
-      };
+          if (pingTimer) clearInterval(pingTimer);
 
-      socket.onclose = () => {
-        if (!active) return;
-        setConnection("Reconnecting...");
-        reconnectTimer = setTimeout(connect, 3000);
-      };
+          pingTimer = setInterval(() => {
+            if (socket?.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ ping: 1 }));
+            }
+          }, 30000);
+        };
+
+        socket.onmessage = event => {
+          if (!active) return;
+
+          try {
+            const response = JSON.parse(event.data);
+
+            if (response.error) {
+              setConnectionError(
+                `${response.error.code || "API ERROR"}: ${response.error.message}`
+              );
+              return;
+            }
+
+            if (response.msg_type !== "tick" || !response.tick) {
+              return;
+            }
+
+            const tick = response.tick;
+            const symbol = tick.symbol;
+            const quote = Number(tick.quote);
+            const precision = Number(tick.pip_size ?? 2);
+
+            if (!Number.isFinite(quote)) return;
+
+            const formatted = quote.toFixed(precision);
+            const digit = Number(formatted.slice(-1));
+
+            setMarkets(previous => {
+              const old = previous[symbol] || {
+                ticks: [],
+                latest: null,
+                connected: true
+              };
+
+              return {
+                ...previous,
+                [symbol]: {
+                  ticks: [
+                    ...old.ticks,
+                    {
+                      quote,
+                      digit,
+                      time: Number(tick.epoch)
+                    }
+                  ].slice(-1000),
+                  latest: quote,
+                  connected: true
+                }
+              };
+            });
+
+            setLastUpdate(
+              new Date(Number(tick.epoch) * 1000).toLocaleTimeString()
+            );
+
+            setConnection("LIVE");
+
+          } catch {
+            setConnectionError("Unable to read Deriv response");
+          }
+        };
+
+        socket.onerror = () => {
+          if (!active) return;
+
+          setConnection("CONNECTION ERROR");
+          setConnectionError(
+            "WebSocket error. Check internet and Deriv App ID."
+          );
+        };
+
+        socket.onclose = event => {
+          if (!active) return;
+
+          if (pingTimer) clearInterval(pingTimer);
+
+          setConnection(`CLOSED ${event.code}`);
+
+          setConnectionError(
+            event.reason || "Connection closed without a reason"
+          );
+
+          reconnectAttempts++;
+
+          const delay = Math.min(
+            2000 * Math.pow(2, reconnectAttempts - 1),
+            30000
+          );
+
+          reconnectTimer = setTimeout(connect, delay);
+        };
+
+      } catch (error) {
+        setConnection("CONNECTION ERROR");
+        setConnectionError(
+          error instanceof Error ? error.message : "Unknown error"
+        );
+
+        reconnectTimer = setTimeout(connect, 5000);
+      }
     };
 
     connect();
@@ -124,22 +189,33 @@ export default function Home() {
     return () => {
       active = false;
       clearTimeout(reconnectTimer);
-      if (socket) socket.close();
+      clearInterval(pingTimer);
+
+      if (socket) {
+        socket.onclose = null;
+        socket.close();
+      }
     };
   }, []);
 
   const data = markets[market];
   const ticks = data?.ticks || [];
   const recent = ticks.slice(-lookback);
+
   const counts = Array(10).fill(0);
 
-  recent.forEach(tick => counts[tick.digit]++);
+  recent.forEach(tick => {
+    counts[tick.digit]++;
+  });
 
   const total = recent.length;
-  const selectedDigit = Number(target);
+  const digit = Number(target);
+  const limit = Number(barrier);
+
   const matchPct = total
-    ? counts[selectedDigit] / total * 100
+    ? counts[digit] / total * 100
     : 0;
+
   const differPct = 100 - matchPct;
 
   const even = total
@@ -149,83 +225,122 @@ export default function Home() {
   const odd = 100 - even;
 
   const over = total
-    ? recent.filter(t => t.digit > Number(barrier)).length / total * 100
+    ? recent.filter(t => t.digit > limit).length / total * 100
     : 0;
 
   const under = total
-    ? recent.filter(t => t.digit < Number(barrier)).length / total * 100
+    ? recent.filter(t => t.digit < limit).length / total * 100
     : 0;
 
   const rising = recent.slice(1).filter(
-    (t, i) => t.quote > recent[i].quote
+    (tick, index) => tick.quote > recent[index].quote
   ).length;
 
   const falling = Math.max(0, total - 1 - rising);
 
-  const risePct = total > 1 ? rising / (total - 1) * 100 : 0;
-  const fallPct = total > 1 ? falling / (total - 1) * 100 : 0;
+  const risePct = total > 1
+    ? rising / (total - 1) * 100
+    : 0;
 
-  const analysis = useMemo(() => {
+  const fallPct = total > 1
+    ? falling / (total - 1) * 100
+    : 0;
+
+  const signal = useMemo(() => {
     if (total < 30) return "COLLECTING TICKS";
 
-    if (contract === "Matches") {
-      return matchPct > 15 ? "CHECK MATCH" : "WAIT";
-    }
+    if (!scannerActive) return "SCANNER PAUSED";
 
-    if (contract === "Differs") {
-      return differPct > 90 ? "CHECK DIFFER" : "WAIT";
-    }
+    switch (contract) {
+      case "Matches":
+        return matchPct > 15 ? "CHECK MATCH" : "WAIT";
 
-    if (contract === "Even") {
-      return even > 55 ? "CHECK EVEN" : "WAIT";
-    }
+      case "Differs":
+        return differPct > 90 ? "CHECK DIFFER" : "WAIT";
 
-    if (contract === "Odd") {
-      return odd > 55 ? "CHECK ODD" : "WAIT";
-    }
+      case "Even":
+        return even > 55 ? "CHECK EVEN" : "WAIT";
 
-    if (contract === "Over") {
-      return over > 55 ? "CHECK OVER" : "WAIT";
-    }
+      case "Odd":
+        return odd > 55 ? "CHECK ODD" : "WAIT";
 
-    if (contract === "Under") {
-      return under > 55 ? "CHECK UNDER" : "WAIT";
-    }
+      case "Over":
+        return over > 55 ? "CHECK OVER" : "WAIT";
 
-    if (contract === "Rise") {
-      return risePct > 55 ? "CHECK RISE" : "WAIT";
-    }
+      case "Under":
+        return under > 55 ? "CHECK UNDER" : "WAIT";
 
-    if (contract === "Fall") {
-      return fallPct > 55 ? "CHECK FALL" : "WAIT";
-    }
+      case "Rise":
+        return risePct > 55 ? "CHECK RISE" : "WAIT";
 
-    return "WAIT";
+      case "Fall":
+        return fallPct > 55 ? "CHECK FALL" : "WAIT";
+
+      default:
+        return "WAIT";
+    }
   }, [
-    total, contract, matchPct, differPct,
-    even, odd, over, under, risePct, fallPct
+    total, scannerActive, contract,
+    matchPct, differPct, even, odd,
+    over, under, risePct, fallPct
   ]);
 
   const latest = data?.latest;
-  const selectedMarket = MARKETS.find(m => m.symbol === market);
+  const currentDigit = ticks.length
+    ? ticks[ticks.length - 1].digit
+    : "--";
 
   return (
     <main className="dashboard">
+
       <header className="header">
         <div>
           <div className="logo">HOPE AI</div>
-          <div className="small">DERIV ANALYZER PRO · V1.0</div>
+          <div className="small">
+            DERIV ANALYZER PRO · V2.0
+          </div>
         </div>
-        <div className="green">● {connection}</div>
+
+        <div className={
+          connection === "LIVE" ? "green" : "red"
+        }>
+          ● {connection}
+        </div>
       </header>
 
       <section className="panel">
+        <h2>CONNECTION DIAGNOSTICS</h2>
+
+        <div className="small">
+          Deriv App ID: {APP_ID}
+        </div>
+
+        <div className="small">
+          Last tick received: {lastUpdate}
+        </div>
+
+        {connectionError && (
+          <p className="red">
+            {connectionError}
+          </p>
+        )}
+
+        <button onClick={() => window.location.reload()}>
+          RELOAD CONNECTION
+        </button>
+      </section>
+
+      <section className="panel">
         <h2>LIVE MARKET SCANNER</h2>
+
         <div className="controls">
           <div>
             <label>SELECT MARKET</label>
-            <select value={market}
-              onChange={e => setMarket(e.target.value)}>
+
+            <select
+              value={market}
+              onChange={e => setMarket(e.target.value)}
+            >
               {MARKETS.map(m => (
                 <option key={m.symbol} value={m.symbol}>
                   {m.name}
@@ -236,11 +351,14 @@ export default function Home() {
 
           <div>
             <label>ANALYSIS HISTORY</label>
-            <select value={lookback}
-              onChange={e => setLookback(Number(e.target.value))}>
-              <option value={100}>100 ticks</option>
-              <option value={500}>500 ticks</option>
-              <option value={1000}>1000 ticks</option>
+
+            <select
+              value={lookback}
+              onChange={e => setLookback(Number(e.target.value))}
+            >
+              <option value={100}>100 TICKS</option>
+              <option value={500}>500 TICKS</option>
+              <option value={1000}>1000 TICKS</option>
             </select>
           </div>
         </div>
@@ -249,37 +367,41 @@ export default function Home() {
           <div className="stat">
             <div className="small">LATEST PRICE</div>
             <div className="digit">
-              {latest === undefined || latest === null
-                ? "--" : latest}
+              {latest ?? "--"}
             </div>
           </div>
+
           <div className="stat">
             <div className="small">TICKS COLLECTED</div>
             <div className="digit">{ticks.length}</div>
           </div>
+
           <div className="stat">
-            <div className="small">CURRENT LAST DIGIT</div>
-            <div className="digit">
-              {ticks.length ? ticks[ticks.length - 1].digit : "--"}
-            </div>
+            <div className="small">LAST DIGIT</div>
+            <div className="digit">{currentDigit}</div>
           </div>
         </div>
       </section>
 
       <section className="panel">
         <h2>ALL MARKET SCANNER</h2>
+
         <div className="grid">
           {MARKETS.map(m => {
             const item = markets[m.symbol];
+
             return (
               <div className="stat" key={m.symbol}>
                 <b>{m.name}</b>
+
                 <div className="green">
                   {item?.ticks.length || 0} ticks
                 </div>
+
                 <div className="small">
                   {item?.latest ?? "Waiting for feed"}
                 </div>
+
                 <button onClick={() => setMarket(m.symbol)}>
                   ANALYSE
                 </button>
@@ -290,14 +412,19 @@ export default function Home() {
       </section>
 
       <section className="panel">
-        <h2>DIGIT DISTRIBUTION</h2>
+        <h2>LAST DIGIT DISTRIBUTION</h2>
+
         <div className="grid">
-          {counts.map((count, digit) => (
-            <div className="stat" key={digit}>
-              <div className="digit">{digit}</div>
+          {counts.map((count, index) => (
+            <div className="stat" key={index}>
+              <div className="digit">{index}</div>
+
               <b>{count}</b>
+
               <div className="small">
-                {total ? (count / total * 100).toFixed(1) : "0.0"}%
+                {total
+                  ? (count / total * 100).toFixed(1)
+                  : "0.0"}%
               </div>
             </div>
           ))}
@@ -310,19 +437,27 @@ export default function Home() {
         <div className="controls">
           <div>
             <label>CONTRACT TYPE</label>
-            <select value={contract}
-              onChange={e => setContract(e.target.value)}>
+
+            <select
+              value={contract}
+              onChange={e => setContract(e.target.value)}
+            >
               {[
                 "Matches", "Differs", "Even", "Odd",
                 "Over", "Under", "Rise", "Fall"
-              ].map(c => <option key={c}>{c}</option>)}
+              ].map(c => (
+                <option key={c}>{c}</option>
+              ))}
             </select>
           </div>
 
           <div>
             <label>MATCH DIGIT</label>
-            <select value={target}
-              onChange={e => setTarget(e.target.value)}>
+
+            <select
+              value={target}
+              onChange={e => setTarget(e.target.value)}
+            >
               {Array.from({ length: 10 }, (_, i) => (
                 <option key={i} value={i}>{i}</option>
               ))}
@@ -331,8 +466,11 @@ export default function Home() {
 
           <div>
             <label>OVER/UNDER BARRIER</label>
-            <select value={barrier}
-              onChange={e => setBarrier(e.target.value)}>
+
+            <select
+              value={barrier}
+              onChange={e => setBarrier(e.target.value)}
+            >
               {Array.from({ length: 9 }, (_, i) => (
                 <option key={i} value={i}>{i}</option>
               ))}
@@ -341,70 +479,69 @@ export default function Home() {
         </div>
 
         <div className="grid">
-          <div className="stat">
-            <div className="small">MATCHES {target}</div>
-            <h2>{matchPct.toFixed(1)}%</h2>
-          </div>
-          <div className="stat">
-            <div className="small">DIFFERS {target}</div>
-            <h2>{differPct.toFixed(1)}%</h2>
-          </div>
-          <div className="stat">
-            <div className="small">EVEN</div>
-            <h2>{even.toFixed(1)}%</h2>
-          </div>
-          <div className="stat">
-            <div className="small">ODD</div>
-            <h2>{odd.toFixed(1)}%</h2>
-          </div>
-          <div className="stat">
-            <div className="small">OVER {barrier}</div>
-            <h2>{over.toFixed(1)}%</h2>
-          </div>
-          <div className="stat">
-            <div className="small">UNDER {barrier}</div>
-            <h2>{under.toFixed(1)}%</h2>
-          </div>
-          <div className="stat">
-            <div className="small">RISE</div>
-            <h2>{risePct.toFixed(1)}%</h2>
-          </div>
-          <div className="stat">
-            <div className="small">FALL</div>
-            <h2>{fallPct.toFixed(1)}%</h2>
-          </div>
+          {[
+            ["MATCHES " + target, matchPct],
+            ["DIFFERS " + target, differPct],
+            ["EVEN", even],
+            ["ODD", odd],
+            ["OVER " + barrier, over],
+            ["UNDER " + barrier, under],
+            ["RISE", risePct],
+            ["FALL", fallPct]
+          ].map(([name, value]) => (
+            <div className="stat" key={String(name)}>
+              <div className="small">{name}</div>
+              <h2>{Number(value).toFixed(1)}%</h2>
+            </div>
+          ))}
         </div>
       </section>
 
       <section className="panel">
         <h2>AI ANALYSIS ENGINE</h2>
+
         <div className="small">
-          MARKET: {selectedMarket?.name} · HISTORY: {total} TICKS
+          MARKET: {MARKETS.find(m => m.symbol === market)?.name}
         </div>
-        <div className="digit">{analysis}</div>
+
+        <div className="small">
+          ANALYSIS SAMPLE: {total} TICKS
+        </div>
+
+        <div className="digit">{signal}</div>
+
         <p className="small">
           {total < 30
-            ? "Collecting at least 30 ticks before analysis."
-            : "Statistical observation only. Historical frequency does not guarantee the next result."}
+            ? "Collecting ticks. At least 30 observations are needed."
+            : "Signals are based on historical frequency, not guaranteed future outcomes."}
         </p>
-        <button onClick={() => setScanning(!scanning)}>
-          {scanning ? "SCANNER ACTIVE" : "SCANNER PAUSED"}
+
+        <button
+          onClick={() => setScannerActive(!scannerActive)}
+        >
+          {scannerActive ? "PAUSE SCANNER" : "START SCANNER"}
         </button>
       </section>
 
       <section className="panel">
         <h2>TRADE EXECUTION</h2>
+
         <div className="small">
-          Execution will be connected after secure Deriv
-          account authorization and demo testing.
+          Deriv account authorization and order execution
+          will be added after live data connection is verified.
         </div>
+
         <p className="red">NO LIVE ORDERS ENABLED</p>
-        <button disabled>EXECUTE TRADE — COMING NEXT</button>
+
+        <button disabled>
+          EXECUTE TRADE — COMING NEXT
+        </button>
       </section>
 
       <footer className="small" style={{ marginTop: 25 }}>
-        HOPE AI DERIV ANALYZER PRO · Market data analysis
+        HOPE AI DERIV ANALYZER PRO · V2.0
       </footer>
+
     </main>
   );
 }
