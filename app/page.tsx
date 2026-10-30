@@ -94,156 +94,81 @@ export default function Home() {
   // One selected market subscription at a time.
   // --------------------------------------------------
 
-  useEffect(() => {
-    let active = true;
-    let socket: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-    let pingTimer: ReturnType<typeof setInterval> | undefined;
-    let reconnectDelay = 2000;
+  
+useEffect(() => {
+  let socket: WebSocket | null = null;
+  let timeout: ReturnType<typeof setTimeout>;
 
-    const connectSynthetic = () => {
-      if (!active) return;
+  setSyntheticStatus("CONNECTING");
+  setSyntheticError("");
+  setSyntheticMessages(0);
 
-      setSyntheticStatus("CONNECTING");
-      setSyntheticError("");
-      currentSubscriptionRef.current = null;
+  try {
+    socket = new WebSocket(
+      "wss://ws.derivws.com/websockets/v3?app_id=1089"
+    );
+
+    socket.onopen = () => {
+      setSyntheticStatus("CONNECTED");
+
+      socket?.send(JSON.stringify({
+        ping: 1,
+        req_id: 100
+      }));
+
+      timeout = setTimeout(() => {
+        if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({
+            active_symbols: "brief",
+            product_type: "basic",
+            req_id: 101
+          }));
+        }
+      }, 1000);
+    };
+
+    socket.onmessage = (event) => {
+      setSyntheticMessages((count) => count + 1);
 
       try {
-        socket = new WebSocket(SYNTHETIC_URL);
-        syntheticSocketRef.current = socket;
+        const data = JSON.parse(event.data);
+        console.log("SYNTHETIC TEST RESPONSE:", data);
 
-        socket.onopen = () => {
-          if (!active || !socket) return;
-
-          reconnectDelay = 2000;
-          setSyntheticStatus("CONNECTED");
-          setSyntheticError("");
-
-          socket.send(
-            JSON.stringify({
-              ticks: selectedMarket,
-              subscribe: 1,
-              req_id: 100,
-            })
-          );
-
-          currentSubscriptionRef.current = selectedMarket;
-
-          pingTimer = setInterval(() => {
-            if (socket?.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify({ ping: 1 }));
-            }
-          }, 12000);
-        };
-
-        socket.onmessage = (event) => {
-          if (!active) return;
-
-          setSyntheticMessages((count) => count + 1);
-
-          try {
-            const data = JSON.parse(event.data);
-
-            if (data.error) {
-              setSyntheticError(
-                data.error.message || "Deriv API returned an error"
-              );
-              return;
-            }
-
-            if (data.msg_type === "tick" && data.tick) {
-              const symbol = data.tick.symbol;
-              const quote = Number(data.tick.quote);
-              const pipSize = Number(data.tick.pip_size ?? 2);
-
-              if (!Number.isFinite(quote)) return;
-
-              const digit = getLastDigit(quote, pipSize);
-
-              setMarkets((previous) => {
-                const current = previous[symbol];
-                if (!current) return previous;
-
-                return {
-                  ...previous,
-                  [symbol]: {
-                    ticks: [
-                      ...current.ticks,
-                      {
-                        quote,
-                        digit,
-                        time: Date.now(),
-                      },
-                    ].slice(-1000),
-                    price: quote,
-                    status: "LIVE",
-                  },
-                };
-              });
-            }
-          } catch {
-            setSyntheticError("Could not read a tick response");
-          }
-        };
-
-        socket.onerror = () => {
-          if (!active) return;
-          setSyntheticStatus("ERROR");
-          setSyntheticError(
-            "WebSocket error. Check the connection and browser console."
-          );
-        };
-
-        socket.onclose = (event) => {
-          if (!active) return;
-
-          setSyntheticStatus("CLOSED");
-          setSyntheticError(
-            `Connection closed. Code: ${event.code}. ${
-              event.reason || "No close reason supplied."
-            }`
-          );
-
-          if (pingTimer) clearInterval(pingTimer);
-
-          setSyntheticReconnects((count) => count + 1);
-
-          reconnectTimer = setTimeout(
-            connectSynthetic,
-            reconnectDelay
-          );
-
-          reconnectDelay = Math.min(reconnectDelay * 2, 30000);
-        };
-      } catch (error) {
-        setSyntheticStatus("ERROR");
-        setSyntheticError(
-          error instanceof Error ? error.message : "Unknown connection error"
-        );
-
-        reconnectTimer = setTimeout(
-          connectSynthetic,
-          reconnectDelay
-        );
+        if (data.error) {
+          setSyntheticError(data.error.message);
+        }
+      } catch {
+        setSyntheticError("Received an unreadable response");
       }
     };
 
-    connectSynthetic();
-
-    return () => {
-      active = false;
-
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (pingTimer) clearInterval(pingTimer);
-
-      if (socket) {
-        socket.onclose = null;
-        socket.close();
-      }
-
-      syntheticSocketRef.current = null;
+    socket.onerror = () => {
+      setSyntheticStatus("ERROR");
+      setSyntheticError("Browser reported a WebSocket error");
     };
-  }, [selectedMarket]);
+
+    socket.onclose = (event) => {
+      setSyntheticStatus("CLOSED");
+      setSyntheticError(
+        `Close code ${event.code}: ${event.reason || "No close reason"}`
+      );
+    };
+  } catch (error) {
+    setSyntheticStatus("ERROR");
+    setSyntheticError(
+      error instanceof Error ? error.message : "Unknown error"
+    );
+  }
+
+  return () => {
+    clearTimeout(timeout);
+    if (socket) {
+      socket.onclose = null;
+      socket.close();
+    }
+  };
+}, []);
+
 
   // --------------------------------------------------
   // OPTIONS PUBLIC CONNECTION
