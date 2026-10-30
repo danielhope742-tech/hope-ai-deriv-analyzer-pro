@@ -5,12 +5,18 @@ import { useEffect, useMemo, useState } from "react";
 
 const APP_ID = "1089";
 
+const SYNTHETIC_URL =
+  `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
+
+const OPTIONS_URL =
+  "wss://api.derivws.com/trading/v1/options/ws/public";
+
 const MARKETS = [
-  { name: "Volatility 10", symbol: "R_10" },
-  { name: "Volatility 25", symbol: "R_25" },
-  { name: "Volatility 50", symbol: "R_50" },
-  { name: "Volatility 75", symbol: "R_75" },
-  { name: "Volatility 100", symbol: "R_100" }
+  { symbol: "R_10", name: "Volatility 10" },
+  { symbol: "R_25", name: "Volatility 25" },
+  { symbol: "R_50", name: "Volatility 50" },
+  { symbol: "R_75", name: "Volatility 75" },
+  { symbol: "R_100", name: "Volatility 100" },
 ];
 
 type Tick = {
@@ -21,59 +27,96 @@ type Tick = {
 
 type MarketData = {
   ticks: Tick[];
-  latest: number | null;
-  connected: boolean;
+  price: number | null;
+  status: string;
 };
 
+type ConnectionStatus = "CONNECTING" | "CONNECTED" | "ERROR" | "CLOSED";
+
+function emptyMarket(): MarketData {
+  return {
+    ticks: [],
+    price: null,
+    status: "WAITING",
+  };
+}
+
+function getLastDigit(quote: number, pipSize: number): number {
+  const decimals = Math.max(0, Math.min(10, pipSize));
+  const fixed = quote.toFixed(decimals);
+  return Number(fixed.charAt(fixed.length - 1));
+}
+
+function percentage(count: number, total: number): string {
+  if (!total) return "0.0";
+  return ((count / total) * 100).toFixed(1);
+}
+
 export default function Home() {
-  const [market, setMarket] = useState("R_100");
-  const [contract, setContract] = useState("Matches");
-  const [target, setTarget] = useState("5");
-  const [barrier, setBarrier] = useState("5");
-  const [lookback, setLookback] = useState(100);
+  const [selectedMarket, setSelectedMarket] = useState("R_100");
+  const [contract, setContract] = useState("DIFFERS");
+  const [targetDigit, setTargetDigit] = useState(5);
+  const [overUnderDigit, setOverUnderDigit] = useState(4);
 
-  const [markets, setMarkets] = useState<
-    Record<string, MarketData>
-  >({});
+  const [markets, setMarkets] = useState<Record<string, MarketData>>(() => {
+    const initial: Record<string, MarketData> = {};
+    MARKETS.forEach((market) => {
+      initial[market.symbol] = emptyMarket();
+    });
+    return initial;
+  });
 
-  const [connection, setConnection] = useState("CONNECTING");
-  const [connectionError, setConnectionError] = useState("");
-  const [lastUpdate, setLastUpdate] = useState("--");
+  const [syntheticStatus, setSyntheticStatus] =
+    useState<ConnectionStatus>("CONNECTING");
+
+  const [syntheticError, setSyntheticError] = useState("");
+
+  const [optionsStatus, setOptionsStatus] =
+    useState<ConnectionStatus>("CONNECTING");
+
+  const [optionsError, setOptionsError] = useState("");
+  const [optionsMessages, setOptionsMessages] = useState(0);
+  const [optionsSymbols, setOptionsSymbols] = useState(0);
+  const [optionsPrice, setOptionsPrice] = useState<number | null>(null);
+
   const [scannerActive, setScannerActive] = useState(true);
+  const [analysisTime, setAnalysisTime] = useState("");
+
+  // --------------------------------------------------
+  // CONNECTION 1: EXISTING DERIV SYNTHETIC INDICES API
+  // --------------------------------------------------
 
   useEffect(() => {
-    let socket: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout>;
-    let pingTimer: ReturnType<typeof setInterval>;
     let active = true;
-    let reconnectAttempts = 0;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let pingTimer: ReturnType<typeof setInterval> | undefined;
+    let reconnectDelay = 2000;
 
-    const connect = () => {
+    const connectSynthetic = () => {
       if (!active) return;
 
-      setConnection("CONNECTING");
-      setConnectionError("");
+      setSyntheticStatus("CONNECTING");
+      setSyntheticError("");
 
       try {
-        socket = new WebSocket(
-          `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`
-        );
+        socket = new WebSocket(SYNTHETIC_URL);
 
         socket.onopen = () => {
           if (!active || !socket) return;
 
-          reconnectAttempts = 0;
-          setConnection("LIVE");
-          setConnectionError("");
+          reconnectDelay = 2000;
+          setSyntheticStatus("CONNECTED");
+          setSyntheticError("");
 
-          MARKETS.forEach(item => {
-            socket?.send(JSON.stringify({
-              ticks: item.symbol,
-              subscribe: 1
-            }));
+          MARKETS.forEach((market) => {
+            socket?.send(
+              JSON.stringify({
+                ticks: market.symbol,
+                subscribe: 1,
+              })
+            );
           });
-
-          if (pingTimer) clearInterval(pingTimer);
 
           pingTimer = setInterval(() => {
             if (socket?.readyState === WebSocket.OPEN) {
@@ -82,114 +125,99 @@ export default function Home() {
           }, 30000);
         };
 
-        socket.onmessage = event => {
+        socket.onmessage = (event) => {
           if (!active) return;
 
           try {
-            const response = JSON.parse(event.data);
+            const data = JSON.parse(event.data);
 
-            if (response.error) {
-              setConnectionError(
-                `${response.error.code || "API ERROR"}: ${response.error.message}`
-              );
+            if (data.error) {
+              setSyntheticError(data.error.message || "Deriv API error");
               return;
             }
 
-            if (response.msg_type !== "tick" || !response.tick) {
-              return;
+            if (data.msg_type === "tick" && data.tick) {
+              const symbol = data.tick.symbol;
+              const quote = Number(data.tick.quote);
+              const pipSize = Number(data.tick.pip_size ?? 2);
+
+              if (!Number.isFinite(quote)) return;
+
+              const digit = getLastDigit(quote, pipSize);
+
+              setMarkets((previous) => {
+                const current = previous[symbol];
+                if (!current) return previous;
+
+                const nextTicks = [
+                  ...current.ticks,
+                  {
+                    quote,
+                    digit,
+                    time: Date.now(),
+                  },
+                ].slice(-1000);
+
+                return {
+                  ...previous,
+                  [symbol]: {
+                    ticks: nextTicks,
+                    price: quote,
+                    status: "LIVE",
+                  },
+                };
+              });
             }
-
-            const tick = response.tick;
-            const symbol = tick.symbol;
-            const quote = Number(tick.quote);
-            const precision = Number(tick.pip_size ?? 2);
-
-            if (!Number.isFinite(quote)) return;
-
-            const formatted = quote.toFixed(precision);
-            const digit = Number(formatted.slice(-1));
-
-            setMarkets(previous => {
-              const old = previous[symbol] || {
-                ticks: [],
-                latest: null,
-                connected: true
-              };
-
-              return {
-                ...previous,
-                [symbol]: {
-                  ticks: [
-                    ...old.ticks,
-                    {
-                      quote,
-                      digit,
-                      time: Number(tick.epoch)
-                    }
-                  ].slice(-1000),
-                  latest: quote,
-                  connected: true
-                }
-              };
-            });
-
-            setLastUpdate(
-              new Date(Number(tick.epoch) * 1000).toLocaleTimeString()
-            );
-
-            setConnection("LIVE");
-
           } catch {
-            setConnectionError("Unable to read Deriv response");
+            setSyntheticError("Could not read a tick message");
           }
         };
 
         socket.onerror = () => {
           if (!active) return;
-
-          setConnection("CONNECTION ERROR");
-          setConnectionError(
-            "WebSocket error. Check internet and Deriv App ID."
-          );
+          setSyntheticStatus("ERROR");
+          setSyntheticError("Synthetic WebSocket connection error");
         };
 
-        socket.onclose = event => {
+        socket.onclose = (event) => {
           if (!active) return;
+
+          setSyntheticStatus("CLOSED");
+          setSyntheticError(
+            `Connection closed. Code: ${event.code}. ${
+              event.reason || "No close reason supplied."
+            }`
+          );
 
           if (pingTimer) clearInterval(pingTimer);
 
-          setConnection(`CLOSED ${event.code}`);
-
-          setConnectionError(
-            event.reason || "Connection closed without a reason"
+          reconnectTimer = setTimeout(
+            connectSynthetic,
+            reconnectDelay
           );
 
-          reconnectAttempts++;
-
-          const delay = Math.min(
-            2000 * Math.pow(2, reconnectAttempts - 1),
-            30000
-          );
-
-          reconnectTimer = setTimeout(connect, delay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 30000);
         };
-
       } catch (error) {
-        setConnection("CONNECTION ERROR");
-        setConnectionError(
-          error instanceof Error ? error.message : "Unknown error"
+        setSyntheticStatus("ERROR");
+        setSyntheticError(
+          error instanceof Error ? error.message : "Unknown connection error"
         );
 
-        reconnectTimer = setTimeout(connect, 5000);
+        reconnectTimer = setTimeout(
+          connectSynthetic,
+          reconnectDelay
+        );
       }
     };
 
-    connect();
+    connectSynthetic();
 
     return () => {
       active = false;
-      clearTimeout(reconnectTimer);
-      clearInterval(pingTimer);
+
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (pingTimer) clearInterval(pingTimer);
 
       if (socket) {
         socket.onclose = null;
@@ -198,350 +226,659 @@ export default function Home() {
     };
   }, []);
 
-  const data = markets[market];
-  const ticks = data?.ticks || [];
-  const recent = ticks.slice(-lookback);
+  // --------------------------------------------------
+  // CONNECTION 2: NEW DERIV OPTIONS PUBLIC API
+  // --------------------------------------------------
 
-  const counts = Array(10).fill(0);
+  useEffect(() => {
+    let active = true;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let pingTimer: ReturnType<typeof setInterval> | undefined;
+    let reconnectDelay = 3000;
 
-  recent.forEach(tick => {
-    counts[tick.digit]++;
-  });
+    const connectOptions = () => {
+      if (!active) return;
 
-  const total = recent.length;
-  const digit = Number(target);
-  const limit = Number(barrier);
+      setOptionsStatus("CONNECTING");
+      setOptionsError("");
 
-  const matchPct = total
-    ? counts[digit] / total * 100
-    : 0;
+      try {
+        socket = new WebSocket(OPTIONS_URL);
 
-  const differPct = 100 - matchPct;
+        socket.onopen = () => {
+          if (!active || !socket) return;
 
-  const even = total
-    ? recent.filter(t => t.digit % 2 === 0).length / total * 100
-    : 0;
+          reconnectDelay = 3000;
+          setOptionsStatus("CONNECTED");
+          setOptionsError("");
 
-  const odd = 100 - even;
+          // Request available public markets.
+          socket.send(
+            JSON.stringify({
+              active_symbols: "brief",
+              req_id: 1,
+            })
+          );
 
-  const over = total
-    ? recent.filter(t => t.digit > limit).length / total * 100
-    : 0;
+          // Public API market-data test subscription.
+          socket.send(
+            JSON.stringify({
+              ticks: "1HZ100V",
+              subscribe: 1,
+              req_id: 2,
+            })
+          );
 
-  const under = total
-    ? recent.filter(t => t.digit < limit).length / total * 100
-    : 0;
+          pingTimer = setInterval(() => {
+            if (socket?.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ ping: 1 }));
+            }
+          }, 30000);
+        };
 
-  const rising = recent.slice(1).filter(
-    (tick, index) => tick.quote > recent[index].quote
-  ).length;
+        socket.onmessage = (event) => {
+          if (!active) return;
 
-  const falling = Math.max(0, total - 1 - rising);
+          setOptionsMessages((count) => count + 1);
 
-  const risePct = total > 1
-    ? rising / (total - 1) * 100
-    : 0;
+          try {
+            const data = JSON.parse(event.data);
 
-  const fallPct = total > 1
-    ? falling / (total - 1) * 100
-    : 0;
+            if (data.error) {
+              setOptionsError(
+                data.error.message || "Options API returned an error"
+              );
+              return;
+            }
 
-  const signal = useMemo(() => {
-    if (total < 30) return "COLLECTING TICKS";
+            if (data.msg_type === "active_symbols") {
+              setOptionsSymbols(
+                Array.isArray(data.active_symbols)
+                  ? data.active_symbols.length
+                  : 0
+              );
+            }
 
-    if (!scannerActive) return "SCANNER PAUSED";
+            if (data.msg_type === "tick" && data.tick) {
+              const price = Number(data.tick.quote);
 
-    switch (contract) {
-      case "Matches":
-        return matchPct > 15 ? "CHECK MATCH" : "WAIT";
+              if (Number.isFinite(price)) {
+                setOptionsPrice(price);
+              }
+            }
+          } catch {
+            setOptionsError("Could not read Options API message");
+          }
+        };
 
-      case "Differs":
-        return differPct > 90 ? "CHECK DIFFER" : "WAIT";
+        socket.onerror = () => {
+          if (!active) return;
 
-      case "Even":
-        return even > 55 ? "CHECK EVEN" : "WAIT";
+          setOptionsStatus("ERROR");
+          setOptionsError("Options WebSocket connection error");
+        };
 
-      case "Odd":
-        return odd > 55 ? "CHECK ODD" : "WAIT";
+        socket.onclose = (event) => {
+          if (!active) return;
 
-      case "Over":
-        return over > 55 ? "CHECK OVER" : "WAIT";
+          setOptionsStatus("CLOSED");
+          setOptionsError(
+            `Connection closed. Code: ${event.code}. ${
+              event.reason || "No close reason supplied."
+            }`
+          );
 
-      case "Under":
-        return under > 55 ? "CHECK UNDER" : "WAIT";
+          if (pingTimer) clearInterval(pingTimer);
 
-      case "Rise":
-        return risePct > 55 ? "CHECK RISE" : "WAIT";
+          reconnectTimer = setTimeout(
+            connectOptions,
+            reconnectDelay
+          );
 
-      case "Fall":
-        return fallPct > 55 ? "CHECK FALL" : "WAIT";
+          reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+        };
+      } catch (error) {
+        setOptionsStatus("ERROR");
+        setOptionsError(
+          error instanceof Error ? error.message : "Unknown connection error"
+        );
 
-      default:
-        return "WAIT";
-    }
-  }, [
-    total, scannerActive, contract,
-    matchPct, differPct, even, odd,
-    over, under, risePct, fallPct
-  ]);
+        reconnectTimer = setTimeout(
+          connectOptions,
+          reconnectDelay
+        );
+      }
+    };
 
-  const latest = data?.latest;
-  const currentDigit = ticks.length
+    connectOptions();
+
+    return () => {
+      active = false;
+
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (pingTimer) clearInterval(pingTimer);
+
+      if (socket) {
+        socket.onclose = null;
+        socket.close();
+      }
+    };
+  }, []);
+
+  // --------------------------------------------------
+  // SELECTED MARKET DATA
+  // --------------------------------------------------
+
+  const selectedData = markets[selectedMarket] || emptyMarket();
+  const ticks = selectedData.ticks;
+
+  const digitCounts = useMemo(() => {
+    const counts = Array(10).fill(0);
+
+    ticks.forEach((tick) => {
+      counts[tick.digit]++;
+    });
+
+    return counts;
+  }, [ticks]);
+
+  const totalTicks = ticks.length;
+
+  const matchCount = digitCounts[targetDigit];
+  const differCount = totalTicks - matchCount;
+
+  const evenCount = digitCounts.reduce(
+    (sum, count, digit) => sum + (digit % 2 === 0 ? count : 0),
+    0
+  );
+
+  const oddCount = totalTicks - evenCount;
+
+  const overCount = digitCounts.reduce(
+    (sum, count, digit) => sum + (digit > overUnderDigit ? count : 0),
+    0
+  );
+
+  const underCount = digitCounts.reduce(
+    (sum, count, digit) => sum + (digit < overUnderDigit ? count : 0),
+    0
+  );
+
+  const lastDigit = ticks.length
     ? ticks[ticks.length - 1].digit
-    : "--";
+    : null;
+
+  const previousDigit = ticks.length > 1
+    ? ticks[ticks.length - 2].digit
+    : null;
+
+  const riseFall =
+    selectedData.price === null || ticks.length < 2
+      ? "WAITING"
+      : ticks[ticks.length - 1].quote >
+          ticks[ticks.length - 2].quote
+        ? "RISE"
+        : ticks[ticks.length - 1].quote <
+            ticks[ticks.length - 2].quote
+          ? "FALL"
+          : "UNCHANGED";
+
+  const selectedPercentage = (() => {
+    switch (contract) {
+      case "MATCHES":
+        return Number(percentage(matchCount, totalTicks));
+      case "DIFFERS":
+        return Number(percentage(differCount, totalTicks));
+      case "EVEN":
+        return Number(percentage(evenCount, totalTicks));
+      case "ODD":
+        return Number(percentage(oddCount, totalTicks));
+      case "OVER":
+        return Number(percentage(overCount, totalTicks));
+      case "UNDER":
+        return Number(percentage(underCount, totalTicks));
+      case "RISE":
+        return riseFall === "RISE" ? 100 : 0;
+      case "FALL":
+        return riseFall === "FALL" ? 100 : 0;
+      default:
+        return 0;
+    }
+  })();
+
+  const analysisSignal = !scannerActive
+    ? "SCANNER PAUSED"
+    : totalTicks < 50
+      ? "COLLECTING TICKS"
+      : selectedPercentage >= 60
+        ? "HIGH HISTORICAL FREQUENCY"
+        : selectedPercentage >= 50
+          ? "MODERATE HISTORICAL FREQUENCY"
+          : "NO STRONG HISTORICAL FREQUENCY";
+
+  function analyseNow() {
+    setAnalysisTime(new Date().toLocaleTimeString());
+  }
+
+  // --------------------------------------------------
+  // UI
+  // --------------------------------------------------
+
+  const panelStyle: React.CSSProperties = {
+    background: "#151d30",
+    border: "1px solid #263653",
+    borderRadius: 14,
+    padding: 16,
+    marginBottom: 14,
+  };
+
+  const mutedStyle: React.CSSProperties = {
+    color: "#9caec9",
+    fontSize: 13,
+  };
+
+  const buttonStyle: React.CSSProperties = {
+    background: "#263b5d",
+    color: "#ffffff",
+    border: "1px solid #3c557c",
+    padding: "11px 14px",
+    borderRadius: 9,
+    fontWeight: 700,
+    cursor: "pointer",
+  };
+
+  const selectStyle: React.CSSProperties = {
+    width: "100%",
+    padding: 12,
+    borderRadius: 8,
+    background: "#0d1525",
+    color: "white",
+    border: "1px solid #344867",
+    marginTop: 6,
+  };
+
+  const statusColor = (status: string) =>
+    status === "CONNECTED" ? "#36d399" : "#ff7373";
 
   return (
-    <main className="dashboard">
-
-      <header className="header">
-        <div>
-          <div className="logo">HOPE AI</div>
-          <div className="small">
-            DERIV ANALYZER PRO · V2.0
-          </div>
+    <main
+      style={{
+        minHeight: "100vh",
+        background: "#080e1b",
+        color: "#f1f5ff",
+        padding: "18px 14px 40px",
+        fontFamily: "Arial, sans-serif",
+        maxWidth: 900,
+        margin: "0 auto",
+      }}
+    >
+      <header style={{ marginBottom: 20 }}>
+        <div style={{ color: "#55d6be", fontSize: 12, fontWeight: 800 }}>
+          HOPE AI • DERIV ANALYZER
         </div>
 
-        <div className={
-          connection === "LIVE" ? "green" : "red"
-        }>
-          ● {connection}
-        </div>
+        <h1 style={{ fontSize: 27, margin: "8px 0" }}>
+          DIGITLAB PRO
+        </h1>
+
+        <p style={mutedStyle}>
+          Live market monitoring and historical digit analysis
+        </p>
       </header>
 
-      <section className="panel">
-        <h2>CONNECTION DIAGNOSTICS</h2>
+      {/* SYNTHETIC CONNECTION */}
 
-        <div className="small">
-          Deriv App ID: {APP_ID}
+      <section style={panelStyle}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          SYNTHETIC INDICES CONNECTION
+        </h2>
+
+        <div style={{ color: statusColor(syntheticStatus), fontWeight: 800 }}>
+          ● {syntheticStatus}
         </div>
 
-        <div className="small">
-          Last tick received: {lastUpdate}
+        <p style={mutedStyle}>
+          API: Deriv WebSocket v3 • App ID: {APP_ID}
+        </p>
+
+        {syntheticError && (
+          <p style={{ color: "#ff8c8c", fontSize: 13 }}>
+            {syntheticError}
+          </p>
+        )}
+      </section>
+
+      {/* OPTIONS CONNECTION */}
+
+      <section style={panelStyle}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          DERIV OPTIONS PUBLIC CONNECTION
+        </h2>
+
+        <div style={{ color: statusColor(optionsStatus), fontWeight: 800 }}>
+          ● {optionsStatus}
         </div>
 
-        {connectionError && (
-          <p className="red">
-            {connectionError}
+        <p style={mutedStyle}>
+          Messages received: {optionsMessages}
+        </p>
+
+        <p style={mutedStyle}>
+          Available symbols received: {optionsSymbols}
+        </p>
+
+        <p style={mutedStyle}>
+          1HZ100V latest price:{" "}
+          {optionsPrice === null ? "Waiting..." : optionsPrice}
+        </p>
+
+        {optionsError && (
+          <p style={{ color: "#ff8c8c", fontSize: 13 }}>
+            {optionsError}
           </p>
         )}
 
-        <button onClick={() => window.location.reload()}>
-          RELOAD CONNECTION
-        </button>
+        <p style={mutedStyle}>
+          Public market-data connection only. It does not access your account
+          or place trades.
+        </p>
       </section>
 
-      <section className="panel">
-        <h2>LIVE MARKET SCANNER</h2>
+      {/* MARKET SELECTOR */}
 
-        <div className="controls">
-          <div>
-            <label>SELECT MARKET</label>
+      <section style={panelStyle}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          MARKET SELECTOR
+        </h2>
 
+        <label style={mutedStyle}>Choose synthetic market</label>
+
+        <select
+          style={selectStyle}
+          value={selectedMarket}
+          onChange={(event) => setSelectedMarket(event.target.value)}
+        >
+          {MARKETS.map((market) => (
+            <option key={market.symbol} value={market.symbol}>
+              {market.name} ({market.symbol})
+            </option>
+          ))}
+        </select>
+
+        <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
+          <div style={{ flex: 1 }}>
+            <div style={mutedStyle}>Latest price</div>
+            <strong style={{ fontSize: 20 }}>
+              {selectedData.price === null
+                ? "--"
+                : selectedData.price}
+            </strong>
+          </div>
+
+          <div style={{ flex: 1 }}>
+            <div style={mutedStyle}>Latest digit</div>
+            <strong style={{ fontSize: 25, color: "#55d6be" }}>
+              {lastDigit === null ? "--" : lastDigit}
+            </strong>
+          </div>
+
+          <div style={{ flex: 1 }}>
+            <div style={mutedStyle}>Ticks collected</div>
+            <strong style={{ fontSize: 20 }}>
+              {totalTicks}
+            </strong>
+          </div>
+        </div>
+      </section>
+
+      {/* CONTRACT SELECTOR */}
+
+      <section style={panelStyle}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          CONTRACT ANALYSIS
+        </h2>
+
+        <label style={mutedStyle}>Choose contract type</label>
+
+        <select
+          style={selectStyle}
+          value={contract}
+          onChange={(event) => setContract(event.target.value)}
+        >
+          <option value="MATCHES">Matches</option>
+          <option value="DIFFERS">Differs</option>
+          <option value="EVEN">Even</option>
+          <option value="ODD">Odd</option>
+          <option value="OVER">Over</option>
+          <option value="UNDER">Under</option>
+          <option value="RISE">Rise</option>
+          <option value="FALL">Fall</option>
+        </select>
+
+        {(contract === "MATCHES" || contract === "DIFFERS") && (
+          <>
+            <label style={mutedStyle}>Target digit</label>
             <select
-              value={market}
-              onChange={e => setMarket(e.target.value)}
+              style={selectStyle}
+              value={targetDigit}
+              onChange={(event) => setTargetDigit(Number(event.target.value))}
             >
-              {MARKETS.map(m => (
-                <option key={m.symbol} value={m.symbol}>
-                  {m.name}
+              {Array.from({ length: 10 }, (_, digit) => (
+                <option key={digit} value={digit}>
+                  Digit {digit}
                 </option>
               ))}
             </select>
-          </div>
+          </>
+        )}
 
-          <div>
-            <label>ANALYSIS HISTORY</label>
-
+        {(contract === "OVER" || contract === "UNDER") && (
+          <>
+            <label style={mutedStyle}>Barrier digit</label>
             <select
-              value={lookback}
-              onChange={e => setLookback(Number(e.target.value))}
+              style={selectStyle}
+              value={overUnderDigit}
+              onChange={(event) =>
+                setOverUnderDigit(Number(event.target.value))
+              }
             >
-              <option value={100}>100 TICKS</option>
-              <option value={500}>500 TICKS</option>
-              <option value={1000}>1000 TICKS</option>
+              {Array.from({ length: 10 }, (_, digit) => (
+                <option key={digit} value={digit}>
+                  {digit}
+                </option>
+              ))}
             </select>
-          </div>
+          </>
+        )}
+
+        <div style={{ marginTop: 18 }}>
+          <div style={mutedStyle}>Historical frequency in collected ticks</div>
+          <strong style={{ fontSize: 30, color: "#55d6be" }}>
+            {selectedPercentage.toFixed(1)}%
+          </strong>
         </div>
 
-        <div className="grid">
-          <div className="stat">
-            <div className="small">LATEST PRICE</div>
-            <div className="digit">
-              {latest ?? "--"}
-            </div>
-          </div>
-
-          <div className="stat">
-            <div className="small">TICKS COLLECTED</div>
-            <div className="digit">{ticks.length}</div>
-          </div>
-
-          <div className="stat">
-            <div className="small">LAST DIGIT</div>
-            <div className="digit">{currentDigit}</div>
-          </div>
-        </div>
+        <p style={mutedStyle}>
+          This percentage describes the collected sample. It is not the
+          probability of the next result.
+        </p>
       </section>
 
-      <section className="panel">
-        <h2>ALL MARKET SCANNER</h2>
+      {/* DIGIT DISTRIBUTION */}
 
-        <div className="grid">
-          {MARKETS.map(m => {
-            const item = markets[m.symbol];
+      <section style={panelStyle}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          DIGIT DISTRIBUTION
+        </h2>
 
-            return (
-              <div className="stat" key={m.symbol}>
-                <b>{m.name}</b>
+        {digitCounts.map((count, digit) => {
+          const pct = Number(percentage(count, totalTicks));
 
-                <div className="green">
-                  {item?.ticks.length || 0} ticks
-                </div>
-
-                <div className="small">
-                  {item?.latest ?? "Waiting for feed"}
-                </div>
-
-                <button onClick={() => setMarket(m.symbol)}>
-                  ANALYSE
-                </button>
+          return (
+            <div key={digit} style={{ marginBottom: 12 }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  fontSize: 13,
+                  marginBottom: 5,
+                }}
+              >
+                <span>Digit {digit}</span>
+                <span>{pct.toFixed(1)}% ({count})</span>
               </div>
-            );
-          })}
-        </div>
-      </section>
 
-      <section className="panel">
-        <h2>LAST DIGIT DISTRIBUTION</h2>
-
-        <div className="grid">
-          {counts.map((count, index) => (
-            <div className="stat" key={index}>
-              <div className="digit">{index}</div>
-
-              <b>{count}</b>
-
-              <div className="small">
-                {total
-                  ? (count / total * 100).toFixed(1)
-                  : "0.0"}%
+              <div
+                style={{
+                  background: "#26344d",
+                  height: 9,
+                  borderRadius: 20,
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    width: `${pct}%`,
+                    height: "100%",
+                    background: "#55d6be",
+                    borderRadius: 20,
+                  }}
+                />
               </div>
             </div>
-          ))}
-        </div>
+          );
+        })}
       </section>
 
-      <section className="panel">
-        <h2>CONTRACT ANALYSIS</h2>
+      {/* ANALYSIS PANEL */}
 
-        <div className="controls">
-          <div>
-            <label>CONTRACT TYPE</label>
+      <section style={panelStyle}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          ANALYSIS ENGINE
+        </h2>
 
-            <select
-              value={contract}
-              onChange={e => setContract(e.target.value)}
-            >
-              {[
-                "Matches", "Differs", "Even", "Odd",
-                "Over", "Under", "Rise", "Fall"
-              ].map(c => (
-                <option key={c}>{c}</option>
-              ))}
-            </select>
-          </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button
+            style={buttonStyle}
+            onClick={analyseNow}
+          >
+            ANALYSE NOW
+          </button>
 
-          <div>
-            <label>MATCH DIGIT</label>
-
-            <select
-              value={target}
-              onChange={e => setTarget(e.target.value)}
-            >
-              {Array.from({ length: 10 }, (_, i) => (
-                <option key={i} value={i}>{i}</option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label>OVER/UNDER BARRIER</label>
-
-            <select
-              value={barrier}
-              onChange={e => setBarrier(e.target.value)}
-            >
-              {Array.from({ length: 9 }, (_, i) => (
-                <option key={i} value={i}>{i}</option>
-              ))}
-            </select>
-          </div>
+          <button
+            style={buttonStyle}
+            onClick={() => setScannerActive((value) => !value)}
+          >
+            {scannerActive ? "PAUSE SCANNER" : "RESUME SCANNER"}
+          </button>
         </div>
 
-        <div className="grid">
-          {[
-            ["MATCHES " + target, matchPct],
-            ["DIFFERS " + target, differPct],
-            ["EVEN", even],
-            ["ODD", odd],
-            ["OVER " + barrier, over],
-            ["UNDER " + barrier, under],
-            ["RISE", risePct],
-            ["FALL", fallPct]
-          ].map(([name, value]) => (
-            <div className="stat" key={String(name)}>
-              <div className="small">{name}</div>
-              <h2>{Number(value).toFixed(1)}%</h2>
+        <div style={{ marginTop: 18 }}>
+          <div style={mutedStyle}>Analysis status</div>
+          <strong style={{ fontSize: 19, color: "#55d6be" }}>
+            {analysisSignal}
+          </strong>
+        </div>
+
+        <p style={mutedStyle}>
+          Contract: {contract}
+        </p>
+
+        <p style={mutedStyle}>
+          Historical frequency: {selectedPercentage.toFixed(1)}%
+        </p>
+
+        <p style={mutedStyle}>
+          Latest digit: {lastDigit === null ? "--" : lastDigit}
+        </p>
+
+        <p style={mutedStyle}>
+          Previous digit: {previousDigit === null ? "--" : previousDigit}
+        </p>
+
+        <p style={mutedStyle}>
+          Latest price direction: {riseFall}
+        </p>
+
+        <p style={mutedStyle}>
+          Last analysis: {analysisTime || "Not analysed yet"}
+        </p>
+
+        <p style={{ color: "#ffc66d", fontSize: 13 }}>
+          WAIT for more data when the sample is small. This scanner does not
+          predict or guarantee the next tick.
+        </p>
+      </section>
+
+      {/* MARKET SUMMARY */}
+
+      <section style={panelStyle}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          ALL MARKETS STATUS
+        </h2>
+
+        {MARKETS.map((market) => {
+          const data = markets[market.symbol];
+
+          return (
+            <div
+              key={market.symbol}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                padding: "10px 0",
+                borderBottom: "1px solid #293650",
+              }}
+            >
+              <span>{market.name}</span>
+              <span style={{ color: data?.price !== null ? "#36d399" : "#ff8c8c" }}>
+                {data?.price === null || data?.price === undefined
+                  ? "WAITING"
+                  : data.price}
+              </span>
             </div>
-          ))}
-        </div>
+          );
+        })}
       </section>
 
-      <section className="panel">
-        <h2>AI ANALYSIS ENGINE</h2>
+      {/* TRADING PANEL */}
 
-        <div className="small">
-          MARKET: {MARKETS.find(m => m.symbol === market)?.name}
+      <section style={panelStyle}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          TRADE EXECUTION
+        </h2>
+
+        <div style={{ color: "#ffc66d", fontWeight: 800 }}>
+          DEMO EXECUTION NOT CONNECTED
         </div>
 
-        <div className="small">
-          ANALYSIS SAMPLE: {total} TICKS
-        </div>
-
-        <div className="digit">{signal}</div>
-
-        <p className="small">
-          {total < 30
-            ? "Collecting ticks. At least 30 observations are needed."
-            : "Signals are based on historical frequency, not guaranteed future outcomes."}
+        <p style={mutedStyle}>
+          This version analyses market data only. It does not place demo or
+          real-money trades.
         </p>
 
         <button
-          onClick={() => setScannerActive(!scannerActive)}
+          style={{
+            ...buttonStyle,
+            width: "100%",
+            opacity: 0.5,
+            cursor: "not-allowed",
+          }}
+          disabled
         >
-          {scannerActive ? "PAUSE SCANNER" : "START SCANNER"}
+          TRADE EXECUTION — NOT ENABLED
         </button>
+
+        <p style={{ color: "#ffc66d", fontSize: 13 }}>
+          Account authorization and secure demo trading must be added
+          separately. Never put your Deriv access token in this page.
+        </p>
       </section>
 
-      <section className="panel">
-        <h2>TRADE EXECUTION</h2>
-
-        <div className="small">
-          Deriv account authorization and order execution
-          will be added after live data connection is verified.
-        </div>
-
-        <p className="red">NO LIVE ORDERS ENABLED</p>
-
-        <button disabled>
-          EXECUTE TRADE — COMING NEXT
-        </button>
-      </section>
-
-      <footer className="small" style={{ marginTop: 25 }}>
-        HOPE AI DERIV ANALYZER PRO · V2.0
+      <footer style={{ textAlign: "center", ...mutedStyle }}>
+        HOPE AI DERIV ANALYZER • DATA MONITORING BUILD
       </footer>
-
     </main>
   );
 }
