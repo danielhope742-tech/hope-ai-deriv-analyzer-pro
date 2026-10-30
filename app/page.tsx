@@ -4,10 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
-const PUBLIC_WS =
-  "wss://api.derivws.com/trading/v1/options/ws/public";
-
-const WINDOW_SIZES = [100, 500, 1000] as const;
+const WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public";
 
 const MARKETS = [
   { symbol: "R_10", name: "Volatility 10" },
@@ -28,670 +25,529 @@ type Tick = {
   time: number;
 };
 
-type MarketData = {
+type MarketState = {
   ticks: Tick[];
   price: number | null;
-  status: string;
   pipSize: number;
+  status: string;
 };
 
-type ActiveSymbol = {
-  symbol?: string;
-  underlying_symbol?: string;
-  display_name?: string;
-  underlying_symbol_name?: string;
-  pip?: number;
-  pip_size?: number;
+type Contract =
+  | "MATCHES"
+  | "DIFFERS"
+  | "EVEN"
+  | "ODD"
+  | "RISE"
+  | "FALL";
+
+type Candidate = {
+  contract: Contract;
+  target?: number;
+  sampleRate: number;
+  baseline: number;
+  edge: number;
+  recentRate: number;
+  label: string;
 };
 
-type ApiMessage = {
-  msg_type?: string;
-  req_id?: number;
-  error?: {
-    message?: string;
-    code?: string;
-  };
-  active_symbols?: ActiveSymbol[];
-  tick?: {
-    symbol?: string;
-    quote?: number | string;
-    epoch?: number;
-    pip_size?: number;
-  };
-};
+const blankMarket = (): MarketState => ({
+  ticks: [],
+  price: null,
+  pipSize: 0.01,
+  status: "WAITING",
+});
 
-type ConnectionStatus =
-  | "CONNECTING"
-  | "CONNECTED"
-  | "ERROR"
-  | "CLOSED";
+const initialMarkets = (): Record<string, MarketState> =>
+  Object.fromEntries(
+    MARKETS.map((market) => [market.symbol, blankMarket()])
+  );
 
-function emptyMarket(): MarketData {
-  return {
-    ticks: [],
-    price: null,
-    status: "WAITING",
-    pipSize: 0.01,
-  };
+function decimals(pip: number): number {
+  if (!Number.isFinite(pip) || pip <= 0) return 2;
+
+  if (pip >= 1) {
+    return Math.min(10, Math.round(pip));
+  }
+
+  const value = pip.toString();
+
+  if (value.includes("e-")) {
+    return Math.min(10, Number(value.split("e-")[1]));
+  }
+
+  return Math.min(10, (value.split(".")[1] || "").length);
 }
 
-function makeInitialMarkets(): Record<string, MarketData> {
-  const initial: Record<string, MarketData> = {};
+function lastDigit(price: number, pip: number): number {
+  const digits = price
+    .toFixed(decimals(pip))
+    .replace(".", "");
 
-  MARKETS.forEach((market) => {
-    initial[market.symbol] = emptyMarket();
+  return Number(digits[digits.length - 1]);
+}
+
+function percentage(count: number, total: number): number {
+  return total > 0 ? (count / total) * 100 : 0;
+}
+
+function buildCandidates(
+  ticks: Tick[],
+  target: number
+): Candidate[] {
+  if (ticks.length < 100) return [];
+
+  const recent = ticks.slice(-100);
+  const digits = ticks.map((tick) => tick.digit);
+  const recentDigits = recent.map((tick) => tick.digit);
+
+  const candidates: Candidate[] = [];
+
+  const matchFull = percentage(
+    digits.filter((digit) => digit === target).length,
+    digits.length
+  );
+
+  const matchRecent = percentage(
+    recentDigits.filter((digit) => digit === target).length,
+    recentDigits.length
+  );
+
+  const matchRate = 0.65 * matchFull + 0.35 * matchRecent;
+
+  candidates.push({
+    contract: "MATCHES",
+    target,
+    sampleRate: matchFull,
+    baseline: 10,
+    edge: matchRate - 10,
+    recentRate: matchRecent,
+    label: `Matches ${target}`,
   });
 
-  return initial;
-}
+  const differFull = 100 - matchFull;
+  const differRecent = 100 - matchRecent;
+  const differRate = 0.65 * differFull + 0.35 * differRecent;
 
-/**
- * Deriv's newer active-symbol response can provide pip_size
- * as a price increment, such as 0.01 or 0.001.
- *
- * Some other responses provide the number of decimal places.
- * This function supports both formats.
- */
-function getDecimalPlaces(pipSize: number): number {
-  if (!Number.isFinite(pipSize) || pipSize <= 0) {
-    return 2;
-  }
+  candidates.push({
+    contract: "DIFFERS",
+    target,
+    sampleRate: differFull,
+    baseline: 90,
+    edge: differRate - 90,
+    recentRate: differRecent,
+    label: `Differs ${target}`,
+  });
 
-  if (pipSize < 1) {
-    const text = pipSize.toString();
+  const evenFull = percentage(
+    digits.filter((digit) => digit % 2 === 0).length,
+    digits.length
+  );
 
-    if (text.includes("e-")) {
-      const exponent = Number(text.split("e-")[1]);
-      return Math.max(0, Math.min(10, exponent));
+  const evenRecent = percentage(
+    recentDigits.filter((digit) => digit % 2 === 0).length,
+    recentDigits.length
+  );
+
+  const oddFull = 100 - evenFull;
+  const oddRecent = 100 - evenRecent;
+
+  const evenRate = 0.65 * evenFull + 0.35 * evenRecent;
+  const oddRate = 0.65 * oddFull + 0.35 * oddRecent;
+
+  candidates.push({
+    contract: "EVEN",
+    sampleRate: evenFull,
+    baseline: 50,
+    edge: evenRate - 50,
+    recentRate: evenRecent,
+    label: "Even",
+  });
+
+  candidates.push({
+    contract: "ODD",
+    sampleRate: oddFull,
+    baseline: 50,
+    edge: oddRate - 50,
+    recentRate: oddRecent,
+    label: "Odd",
+  });
+
+  let rises = 0;
+  let falls = 0;
+  const directions: number[] = [];
+
+  for (let i = 1; i < ticks.length; i++) {
+    const direction = Math.sign(
+      ticks[i].quote - ticks[i - 1].quote
+    );
+
+    if (direction > 0) {
+      rises++;
+      directions.push(1);
+    } else if (direction < 0) {
+      falls++;
+      directions.push(-1);
     }
-
-    const decimalPart = text.split(".")[1] || "";
-    return Math.max(0, Math.min(10, decimalPart.length));
   }
 
-  return Math.max(0, Math.min(10, Math.round(pipSize)));
-}
+  const directionTotal = rises + falls;
 
-function getLastDigit(
-  quote: number,
-  pipSize: number
-): number {
-  const decimals = getDecimalPlaces(pipSize);
-  const fixed = quote.toFixed(decimals);
-  const digitsOnly = fixed.replace(".", "");
+  if (directionTotal >= 50) {
+    const recentDirections = directions.slice(-100);
 
-  return Number(digitsOnly.charAt(digitsOnly.length - 1));
-}
+    const riseFull = percentage(rises, directionTotal);
+    const riseRecent = percentage(
+      recentDirections.filter((direction) => direction > 0).length,
+      recentDirections.length
+    );
 
-function percentage(count: number, total: number): string {
-  if (!total) return "0.0";
-  return ((count / total) * 100).toFixed(1);
+    const fallFull = 100 - riseFull;
+    const fallRecent = 100 - riseRecent;
+
+    const riseRate = 0.65 * riseFull + 0.35 * riseRecent;
+    const fallRate = 0.65 * fallFull + 0.35 * fallRecent;
+
+    candidates.push({
+      contract: "RISE",
+      sampleRate: riseFull,
+      baseline: 50,
+      edge: riseRate - 50,
+      recentRate: riseRecent,
+      label: "Rise",
+    });
+
+    candidates.push({
+      contract: "FALL",
+      sampleRate: fallFull,
+      baseline: 50,
+      edge: fallRate - 50,
+      recentRate: fallRecent,
+      label: "Fall",
+    });
+  }
+
+  return candidates.sort((a, b) => b.edge - a.edge);
 }
 
 export default function Home() {
   const [selectedMarket, setSelectedMarket] = useState("R_100");
-  const [contract, setContract] = useState("DIFFERS");
-  const [targetDigit, setTargetDigit] = useState(5);
-  const [barrierDigit, setBarrierDigit] = useState(4);
-  const [windowSize, setWindowSize] = useState<number>(500);
-
   const [markets, setMarkets] =
-    useState<Record<string, MarketData>>(makeInitialMarkets);
+    useState<Record<string, MarketState>>(initialMarkets);
 
-  const [connectionStatus, setConnectionStatus] =
-    useState<ConnectionStatus>("CONNECTING");
+  const [status, setStatus] = useState("CONNECTING");
+  const [error, setError] = useState("");
+  const [received, setReceived] = useState(0);
+  const [scannerOn, setScannerOn] = useState(true);
+  const [windowSize, setWindowSize] = useState(500);
+  const [target, setTarget] = useState(5);
 
-  const [connectionError, setConnectionError] = useState("");
-  const [messagesReceived, setMessagesReceived] = useState(0);
-  const [availableSymbols, setAvailableSymbols] = useState<string[]>([]);
-  const [scannerActive, setScannerActive] = useState(true);
-  const [analysisTime, setAnalysisTime] = useState("");
-  const [rawResponse, setRawResponse] = useState("");
+  const [analysis, setAnalysis] = useState<Candidate | null>(null);
+  const [analysisMessage, setAnalysisMessage] = useState(
+    "Collecting live ticks. At least 100 are needed before screening signals."
+  );
 
   const socketRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef =
-    useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const reconnectDelayRef = useRef(3000);
-  const activeRef = useRef(true);
-  const scannerActiveRef = useRef(true);
-  const subscribedRef = useRef<Set<string>>(new Set());
+  const marketsRef = useRef(markets);
+  const scannerRef = useRef(scannerOn);
+  const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stoppedRef = useRef(false);
 
   useEffect(() => {
-    scannerActiveRef.current = scannerActive;
-  }, [scannerActive]);
-
-  // DERIV PUBLIC MARKET DATA CONNECTION
+    marketsRef.current = markets;
+  }, [markets]);
 
   useEffect(() => {
-    activeRef.current = true;
+    scannerRef.current = scannerOn;
+  }, [scannerOn]);
+
+  useEffect(() => {
+    stoppedRef.current = false;
+
+    let delay = 2500;
 
     const connect = () => {
-      if (!activeRef.current) return;
+      if (stoppedRef.current) return;
 
-      setConnectionStatus("CONNECTING");
-      setConnectionError("");
-      subscribedRef.current.clear();
+      setStatus("CONNECTING");
 
-      let socket: WebSocket;
+      let ws: WebSocket;
 
       try {
-        socket = new WebSocket(PUBLIC_WS);
-        socketRef.current = socket;
-      } catch (error) {
-        setConnectionStatus("ERROR");
+        ws = new WebSocket(WS_URL);
+        socketRef.current = ws;
+      } catch {
+        setStatus("ERROR");
+        setError("Could not start the Deriv connection.");
 
-        setConnectionError(
-          error instanceof Error
-            ? error.message
-            : "Could not create WebSocket connection."
-        );
-
-        scheduleReconnect();
+        reconnectRef.current = setTimeout(connect, delay);
+        delay = Math.min(delay * 2, 30000);
         return;
       }
 
-      function scheduleReconnect() {
-        if (!activeRef.current) return;
+      ws.onopen = () => {
+        if (stoppedRef.current) return;
 
-        if (reconnectTimerRef.current) {
-          clearTimeout(reconnectTimerRef.current);
-        }
+        delay = 2500;
+        setStatus("CONNECTED");
+        setError("");
 
-        reconnectTimerRef.current = setTimeout(
-          connect,
-          reconnectDelayRef.current
-        );
-
-        reconnectDelayRef.current = Math.min(
-          reconnectDelayRef.current * 2,
-          30000
-        );
-      }
-
-      socket.onopen = () => {
-        if (!activeRef.current) return;
-
-        reconnectDelayRef.current = 3000;
-        setConnectionStatus("CONNECTED");
-        setConnectionError("");
-
-        // Request available synthetic markets.
-        socket.send(
+        ws.send(
           JSON.stringify({
             active_symbols: "brief",
             req_id: 1,
           })
         );
-
-        socket.send(
-          JSON.stringify({
-            ping: 1,
-            req_id: 2,
-          })
-        );
       };
 
-      socket.onmessage = (event) => {
-        if (!activeRef.current) return;
+      ws.onmessage = (event) => {
+        if (stoppedRef.current) return;
 
-        setMessagesReceived((count) => count + 1);
+        setReceived((count) => count + 1);
 
-        let data: ApiMessage;
+        let message: any;
 
         try {
-          data = JSON.parse(event.data);
-
-          setRawResponse(
-            JSON.stringify(data, null, 2).slice(0, 5000)
-          );
+          message = JSON.parse(event.data);
         } catch {
-          setConnectionError(
-            "The Deriv response could not be read as JSON."
+          setError("Could not read the Deriv response.");
+          return;
+        }
+
+        if (message.error) {
+          setError(
+            message.error.message ||
+              message.error.code ||
+              "Deriv API error."
           );
           return;
         }
 
-        // Display API errors.
-        if (data.error) {
-          const message =
-            data.error.message ||
-            data.error.code ||
-            "Deriv API error.";
-
-          setConnectionError(message);
-          return;
-        }
-
-        // HANDLE ACTIVE SYMBOLS.
-        // Important: support both symbol and underlying_symbol.
-
-        if (Array.isArray(data.active_symbols)) {
-          const returnedMarkets = data.active_symbols
-            .map((item) => {
-              const symbol =
-                item.symbol || item.underlying_symbol;
-
-              return {
-                symbol,
-                pipSize:
-                  item.pip_size ??
-                  item.pip ??
-                  0.01,
-              };
-            })
-            .filter(
-              (item): item is {
-                symbol: string;
-                pipSize: number;
-              } => Boolean(item.symbol)
+        if (Array.isArray(message.active_symbols)) {
+          const active = message.active_symbols
+            .map((item: any) => ({
+              symbol: item.symbol || item.underlying_symbol,
+              pip: Number(item.pip_size ?? item.pip ?? 0.01) || 0.01,
+            }))
+            .filter((item: any) =>
+              MARKETS.some((market) => market.symbol === item.symbol)
             );
 
-          const returnedSymbols = returnedMarkets.map(
-            (item) => item.symbol
-          );
-
-          const wantedMarkets = returnedMarkets.filter(
-            (item) =>
-              MARKETS.some(
-                (market) => market.symbol === item.symbol
-              )
-          );
-
-          const wantedSymbols = wantedMarkets.map(
-            (item) => item.symbol
-          );
-
-          setAvailableSymbols(wantedSymbols);
-
-          if (wantedMarkets.length === 0) {
-            setConnectionError(
-              "Deriv returned markets, but none matched the selected market list. Check the API response."
-            );
+          if (active.length === 0) {
+            setError("Deriv did not return any of the requested markets.");
             return;
           }
 
-          // Save each market's price precision.
           setMarkets((previous) => {
-            const updated = { ...previous };
+            const next = { ...previous };
 
-            wantedMarkets.forEach((item) => {
-              updated[item.symbol] = {
-                ...updated[item.symbol],
-                pipSize: Number(item.pipSize) || 0.01,
+            active.forEach((item: any) => {
+              next[item.symbol] = {
+                ...next[item.symbol],
+                pipSize: item.pip,
                 status: "SUBSCRIBING",
               };
             });
 
-            return updated;
+            return next;
           });
 
-          // Subscribe to each available market.
-          wantedMarkets.forEach((item, index) => {
-            const symbol = item.symbol;
+          active.forEach((item: any, index: number) => {
+            if (ws.readyState !== WebSocket.OPEN) return;
 
-            if (
-              socket.readyState !== WebSocket.OPEN ||
-              subscribedRef.current.has(symbol)
-            ) {
-              return;
-            }
-
-            subscribedRef.current.add(symbol);
-
-            socket.send(
+            ws.send(
               JSON.stringify({
-                ticks: symbol,
+                ticks: item.symbol,
                 subscribe: 1,
                 req_id: 100 + index,
               })
             );
           });
 
-          if (wantedSymbols.length < MARKETS.length) {
-            setConnectionError(
-              `Found ${wantedSymbols.length} of ${MARKETS.length} requested markets. Some requested symbols were not returned by Deriv.`
+          if (active.length !== MARKETS.length) {
+            setError(
+              `Deriv returned ${active.length} of ${MARKETS.length} requested markets.`
             );
           }
 
           return;
         }
 
-        // HANDLE LIVE TICKS.
-        // Do not depend only on msg_type; use the tick object too.
-
-        if (data.tick) {
-          const symbol = data.tick.symbol;
-          const quote = Number(data.tick.quote);
+        if (message.tick?.symbol) {
+          const symbol = message.tick.symbol;
+          const quote = Number(message.tick.quote);
 
           if (
-            !symbol ||
-            !MARKETS.some(
-              (market) => market.symbol === symbol
-            ) ||
-            !Number.isFinite(quote)
+            !Number.isFinite(quote) ||
+            !MARKETS.some((market) => market.symbol === symbol) ||
+            !scannerRef.current
           ) {
             return;
           }
 
-          if (!scannerActiveRef.current) return;
+          const oldMarket =
+            marketsRef.current[symbol] || blankMarket();
 
-          const existingMarket =
-            marketsRef.current[symbol] || emptyMarket();
-
-          const pipSize =
-            Number(data.tick.pip_size) ||
-            existingMarket.pipSize ||
+          const pip =
+            Number(message.tick.pip_size) ||
+            oldMarket.pipSize ||
             0.01;
-
-          const digit = getLastDigit(quote, pipSize);
-
-          const epoch = Number(data.tick.epoch);
 
           const tick: Tick = {
             quote,
-            digit,
-            time: Number.isFinite(epoch)
-              ? epoch
-              : Date.now() / 1000,
+            digit: lastDigit(quote, pip),
+            time: Number(message.tick.epoch) || Date.now() / 1000,
           };
 
           setMarkets((previous) => {
-            const oldMarket =
-              previous[symbol] || emptyMarket();
-
-            const updatedTicks = [
-              ...oldMarket.ticks,
-              tick,
-            ].slice(-1000);
+            const current = previous[symbol] || blankMarket();
 
             return {
               ...previous,
               [symbol]: {
-                ticks: updatedTicks,
+                ...current,
+                ticks: [...current.ticks, tick].slice(-1000),
                 price: quote,
+                pipSize: pip,
                 status: "LIVE",
-                pipSize,
               },
             };
           });
 
-          setConnectionError("");
-          return;
+          setError("");
         }
       };
 
-      socket.onerror = () => {
-        if (!activeRef.current) return;
-
-        setConnectionStatus("ERROR");
-
-        setConnectionError(
-          "WebSocket error. Check your connection and the Deriv endpoint."
-        );
+      ws.onerror = () => {
+        if (!stoppedRef.current) {
+          setStatus("ERROR");
+          setError("WebSocket error. Check your internet connection.");
+        }
       };
 
-      socket.onclose = (event) => {
-        if (!activeRef.current) return;
+      ws.onclose = (event) => {
+        if (stoppedRef.current) return;
 
-        setConnectionStatus("CLOSED");
+        setStatus("DISCONNECTED");
+        setError(`Connection closed (${event.code}). Reconnecting…`);
 
-        setConnectionError(
-          `Connection closed. Code: ${event.code}. ${
-            event.reason || "No close reason supplied."
-          }`
-        );
-
-        setMarkets((previous) => {
-          const updated = { ...previous };
-
-          Object.keys(updated).forEach((symbol) => {
-            updated[symbol] = {
-              ...updated[symbol],
-              status: "DISCONNECTED",
-            };
-          });
-
-          return updated;
-        });
-
-        scheduleReconnect();
+        reconnectRef.current = setTimeout(connect, delay);
+        delay = Math.min(delay * 2, 30000);
       };
     };
 
     connect();
 
     return () => {
-      activeRef.current = false;
+      stoppedRef.current = true;
 
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
+      if (reconnectRef.current) {
+        clearTimeout(reconnectRef.current);
       }
 
-      const socket = socketRef.current;
-
-      if (socket) {
-        socket.onopen = null;
-        socket.onmessage = null;
-        socket.onerror = null;
-        socket.onclose = null;
-        socket.close();
+      if (socketRef.current) {
+        socketRef.current.onopen = null;
+        socketRef.current.onmessage = null;
+        socketRef.current.onerror = null;
+        socketRef.current.onclose = null;
+        socketRef.current.close();
       }
-
-      socketRef.current = null;
     };
   }, []);
 
-  // Keep a current reference to market state for WebSocket callbacks.
-  const marketsRef = useRef(markets);
-
-  useEffect(() => {
-    marketsRef.current = markets;
-  }, [markets]);
-
-  // SELECTED MARKET ANALYSIS
-
-  const selectedData =
-    markets[selectedMarket] || emptyMarket();
-
-  const allTicks = selectedData.ticks;
+  const selected = markets[selectedMarket] || blankMarket();
 
   const ticks = useMemo(
-    () => allTicks.slice(-windowSize),
-    [allTicks, windowSize]
+    () => selected.ticks.slice(-windowSize),
+    [selected.ticks, windowSize]
   );
 
-  const digitCounts = useMemo(() => {
-    const counts = Array(10).fill(0);
-
-    ticks.forEach((tick) => {
-      counts[tick.digit]++;
-    });
-
-    return counts;
-  }, [ticks]);
-
-  const totalTicks = ticks.length;
-
-  const matchCount = digitCounts[targetDigit];
-  const differCount = totalTicks - matchCount;
-
-  const evenCount = digitCounts.reduce(
-    (sum, count, digit) =>
-      sum + (digit % 2 === 0 ? count : 0),
-    0
+  const digitCounts = useMemo(
+    () =>
+      Array.from({ length: 10 }, (_, digit) =>
+        ticks.filter((tick) => tick.digit === digit).length
+      ),
+    [ticks]
   );
 
-  const oddCount = totalTicks - evenCount;
+  const last = ticks[ticks.length - 1];
 
-  const overCount = digitCounts.reduce(
-    (sum, count, digit) =>
-      sum + (digit > barrierDigit ? count : 0),
-    0
+  const candidates = useMemo(
+    () => buildCandidates(ticks, target),
+    [ticks, target]
   );
-
-  const underCount = digitCounts.reduce(
-    (sum, count, digit) =>
-      sum + (digit < barrierDigit ? count : 0),
-    0
-  );
-
-  const lastTick = ticks[ticks.length - 1];
-  const previousTick = ticks[ticks.length - 2];
-
-  const lastDigit = lastTick ? lastTick.digit : null;
-
-  const previousDigit = previousTick
-    ? previousTick.digit
-    : null;
-
-  let riseCount = 0;
-  let fallCount = 0;
-  let unchangedCount = 0;
-
-  for (let i = 1; i < ticks.length; i++) {
-    if (ticks[i].quote > ticks[i - 1].quote) {
-      riseCount++;
-    } else if (ticks[i].quote < ticks[i - 1].quote) {
-      fallCount++;
-    } else {
-      unchangedCount++;
-    }
-  }
-
-  const directionTotal =
-    riseCount + fallCount + unchangedCount;
-
-  const riseFall =
-    !lastTick || !previousTick
-      ? "WAITING"
-      : lastTick.quote > previousTick.quote
-        ? "RISE"
-        : lastTick.quote < previousTick.quote
-          ? "FALL"
-          : "UNCHANGED";
-
-  const selectedPercentage = (() => {
-    switch (contract) {
-      case "MATCHES":
-        return Number(
-          percentage(matchCount, totalTicks)
-        );
-
-      case "DIFFERS":
-        return Number(
-          percentage(differCount, totalTicks)
-        );
-
-      case "EVEN":
-        return Number(
-          percentage(evenCount, totalTicks)
-        );
-
-      case "ODD":
-        return Number(
-          percentage(oddCount, totalTicks)
-        );
-
-      case "OVER":
-        return Number(
-          percentage(overCount, totalTicks)
-        );
-
-      case "UNDER":
-        return Number(
-          percentage(underCount, totalTicks)
-        );
-
-      case "RISE":
-        return Number(
-          percentage(riseCount, directionTotal)
-        );
-
-      case "FALL":
-        return Number(
-          percentage(fallCount, directionTotal)
-        );
-
-      default:
-        return 0;
-    }
-  })();
-
-  const analysisSignal = !scannerActive
-    ? "SCANNER PAUSED"
-    : totalTicks < 50
-      ? "COLLECTING TICKS"
-      : selectedPercentage >= 60
-        ? "HIGH HISTORICAL FREQUENCY"
-        : selectedPercentage >= 50
-          ? "MODERATE HISTORICAL FREQUENCY"
-          : "NO STRONG HISTORICAL FREQUENCY";
 
   function analyseNow() {
-    setAnalysisTime(new Date().toLocaleTimeString());
+    if (ticks.length < 100) {
+      setAnalysis(null);
+      setAnalysisMessage(
+        `NO CONFIDENT SIGNAL — only ${ticks.length} ticks collected. At least 100 are needed for an initial screen.`
+      );
+      return;
+    }
+
+    const best = candidates[0];
+
+    if (
+      !best ||
+      best.edge < 3 ||
+      best.recentRate < best.baseline + 1
+    ) {
+      setAnalysis(null);
+      setAnalysisMessage(
+        "NO CONFIDENT SIGNAL — the historical sample does not show a sufficiently consistent difference from baseline."
+      );
+      return;
+    }
+
+    setAnalysis(best);
+    setAnalysisMessage(
+      "A statistical candidate was found for review. It is not a prediction guarantee or a trade instruction."
+    );
   }
 
-  // STYLES
-
-  const panelStyle: CSSProperties = {
+  const panel: CSSProperties = {
     background: "#151d30",
-    border: "1px solid #263653",
+    border: "1px solid #293a58",
     borderRadius: 14,
     padding: 16,
     marginBottom: 14,
   };
 
-  const mutedStyle: CSSProperties = {
-    color: "#9caec9",
+  const muted: CSSProperties = {
+    color: "#a9bad2",
     fontSize: 13,
-  };
-
-  const buttonStyle: CSSProperties = {
-    background: "#263b5d",
-    color: "#ffffff",
-    border: "1px solid #3c557c",
-    padding: "11px 14px",
-    borderRadius: 9,
-    fontWeight: 700,
-    cursor: "pointer",
   };
 
   const selectStyle: CSSProperties = {
     width: "100%",
     padding: 12,
-    borderRadius: 8,
-    background: "#0d1525",
-    color: "white",
-    border: "1px solid #344867",
     marginTop: 6,
+    borderRadius: 8,
+    background: "#0c1526",
+    color: "white",
+    border: "1px solid #405575",
   };
 
-  const statusColor = (status: string) => {
-    if (status === "CONNECTED" || status === "LIVE") {
-      return "#36d399";
-    }
-
-    if (
-      status === "CONNECTING" ||
-      status === "SUBSCRIBING"
-    ) {
-      return "#ffc66d";
-    }
-
-    return "#ff7373";
+  const button: CSSProperties = {
+    padding: "11px 14px",
+    borderRadius: 9,
+    border: "1px solid #496487",
+    background: "#263b5d",
+    color: "white",
+    fontWeight: 700,
+    cursor: "pointer",
   };
 
   return (
     <main
       style={{
         minHeight: "100vh",
-        background: "#080e1b",
-        color: "#f1f5ff",
-        padding: "18px 14px 40px",
-        fontFamily: "Arial, sans-serif",
         maxWidth: 900,
         margin: "0 auto",
+        padding: "18px 14px 40px",
+        background: "#080e1b",
+        color: "#f1f5ff",
+        fontFamily: "Arial, sans-serif",
       }}
     >
       <header style={{ marginBottom: 20 }}>
@@ -702,346 +558,170 @@ export default function Home() {
             fontWeight: 800,
           }}
         >
-          HOPE AI • DERIV ANALYZER PRO
+          HOPE AI • DERIV ANALYZER PRO V2.40
         </div>
 
         <h1 style={{ fontSize: 27, margin: "8px 0" }}>
           HOPE AI DERIV ANALYZER PRO
         </h1>
 
-        <p style={mutedStyle}>
-          Live synthetic-market monitoring and historical digit analysis
+        <p style={muted}>
+          Live synthetic-market monitoring and statistical signal screening
         </p>
       </header>
 
-      {/* CONNECTION */}
-
-      <section style={panelStyle}>
+      <section style={panel}>
         <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          DERIV PUBLIC MARKET CONNECTION
+          PUBLIC MARKET CONNECTION
         </h2>
 
-        <div
+        <strong
           style={{
-            color: statusColor(connectionStatus),
-            fontWeight: 800,
+            color: status === "CONNECTED" ? "#36d399" : "#ffc66d",
           }}
         >
-          ● {connectionStatus}
-        </div>
+          ● {status}
+        </strong>
 
-        <p style={mutedStyle}>
-          Public market-data connection. No legacy App ID 1089.
+        <p style={muted}>
+          Messages received: {received} · Public prices only · No account token used
         </p>
 
-        <p style={mutedStyle}>
-          Messages received: {messagesReceived}
-        </p>
-
-        <p style={mutedStyle}>
-          Requested markets available: {availableSymbols.length} / {MARKETS.length}
-        </p>
-
-        {connectionError && (
-          <p style={{ color: "#ff8c8c", fontSize: 13 }}>
-            {connectionError}
-          </p>
+        {error && (
+          <p style={{ color: "#ff9292", fontSize: 13 }}>{error}</p>
         )}
 
-        {rawResponse && (
-          <details style={{ marginTop: 12 }}>
-            <summary
-              style={{
-                cursor: "pointer",
-                color: "#55d6be",
-              }}
-            >
-              View Deriv API response
-            </summary>
-
-            <pre
-              style={{
-                whiteSpace: "pre-wrap",
-                overflowWrap: "anywhere",
-                fontSize: 11,
-                color: "#c6d5ed",
-                background: "#0d1525",
-                padding: 10,
-                borderRadius: 8,
-                maxHeight: 250,
-                overflow: "auto",
-              }}
-            >
-              {rawResponse}
-            </pre>
-          </details>
-        )}
-
-        <p style={mutedStyle}>
-          This connection reads public prices only. It does not access your
-          Deriv account or place trades.
+        <p style={muted}>
+          This connection does not access your balance or place trades.
         </p>
       </section>
 
-      {/* MARKET SELECTOR */}
+      <section style={panel}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>MARKET SELECTOR</h2>
 
-      <section style={panelStyle}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          MARKET SELECTOR
-        </h2>
-
-        <label style={mutedStyle}>
-          Choose synthetic market
-        </label>
+        <label style={muted}>Choose one of the 10 synthetic markets</label>
 
         <select
           style={selectStyle}
           value={selectedMarket}
-          onChange={(event) =>
-            setSelectedMarket(event.target.value)
-          }
+          onChange={(event) => {
+            setSelectedMarket(event.target.value);
+            setAnalysis(null);
+            setAnalysisMessage("Market changed. Collect ticks and analyse again.");
+          }}
         >
           {MARKETS.map((market) => (
-            <option
-              key={market.symbol}
-              value={market.symbol}
-            >
+            <option key={market.symbol} value={market.symbol}>
               {market.name} ({market.symbol})
-              {availableSymbols.includes(market.symbol)
-                ? ""
-                : " — checking"}
             </option>
           ))}
         </select>
 
-        <div
-          style={{
-            display: "flex",
-            gap: 12,
-            marginTop: 16,
-          }}
-        >
+        <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
           <div style={{ flex: 1 }}>
-            <div style={mutedStyle}>Latest price</div>
+            <div style={muted}>Latest price</div>
+            <strong>{selected.price ?? "--"}</strong>
+          </div>
 
-            <strong style={{ fontSize: 20 }}>
-              {selectedData.price === null
-                ? "--"
-                : selectedData.price}
+          <div style={{ flex: 1 }}>
+            <div style={muted}>Last digit</div>
+            <strong style={{ color: "#55d6be", fontSize: 24 }}>
+              {last?.digit ?? "--"}
             </strong>
           </div>
 
           <div style={{ flex: 1 }}>
-            <div style={mutedStyle}>Latest digit</div>
-
-            <strong
-              style={{
-                fontSize: 25,
-                color: "#55d6be",
-              }}
-            >
-              {lastDigit === null ? "--" : lastDigit}
-            </strong>
-          </div>
-
-          <div style={{ flex: 1 }}>
-            <div style={mutedStyle}>Ticks collected</div>
-
-            <strong style={{ fontSize: 20 }}>
-              {totalTicks}
-            </strong>
+            <div style={muted}>Ticks in window</div>
+            <strong>{ticks.length}</strong>
           </div>
         </div>
 
-        <p style={mutedStyle}>
-          Market status:{" "}
-          <span
-            style={{
-              color: statusColor(selectedData.status),
-            }}
-          >
-            {selectedData.status}
-          </span>
+        <p style={muted}>
+          Market feed: {selected.status}. Up to 1,000 ticks are stored per market during this session.
         </p>
       </section>
 
-      {/* ANALYSIS WINDOW */}
+      <section style={panel}>
+        <h2 style={{ fontSize: 17, marginTop: 0 }}>ANALYSIS SETTINGS</h2>
 
-      <section style={panelStyle}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          ANALYSIS WINDOW
-        </h2>
-
-        <label style={mutedStyle}>
-          Number of recent ticks
-        </label>
+        <label style={muted}>Historical window</label>
 
         <select
           style={selectStyle}
           value={windowSize}
-          onChange={(event) =>
-            setWindowSize(Number(event.target.value))
-          }
+          onChange={(event) => {
+            setWindowSize(Number(event.target.value));
+            setAnalysis(null);
+          }}
         >
-          {WINDOW_SIZES.map((size) => (
+          {[100, 500, 1000].map((size) => (
             <option key={size} value={size}>
               Last {size} ticks
             </option>
           ))}
         </select>
 
-        <p style={mutedStyle}>
-          The scanner stores up to 1,000 ticks per market.
-        </p>
-      </section>
-
-      {/* CONTRACT SELECTOR */}
-
-      <section style={panelStyle}>
-        <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          CONTRACT ANALYSIS
-        </h2>
-
-        <label style={mutedStyle}>
-          Choose contract type
+        <label
+          style={{ ...muted, display: "block", marginTop: 14 }}
+        >
+          Target digit for Matches/Differs
         </label>
 
         <select
           style={selectStyle}
-          value={contract}
-          onChange={(event) =>
-            setContract(event.target.value)
-          }
+          value={target}
+          onChange={(event) => setTarget(Number(event.target.value))}
         >
-          <option value="MATCHES">Matches</option>
-          <option value="DIFFERS">Differs</option>
-          <option value="EVEN">Even</option>
-          <option value="ODD">Odd</option>
-          <option value="OVER">Over</option>
-          <option value="UNDER">Under</option>
-          <option value="RISE">Rise</option>
-          <option value="FALL">Fall</option>
+          {Array.from({ length: 10 }, (_, digit) => (
+            <option key={digit} value={digit}>
+              Digit {digit}
+            </option>
+          ))}
         </select>
 
-        {(contract === "MATCHES" ||
-          contract === "DIFFERS") && (
-          <>
-            <label style={mutedStyle}>
-              Target digit
-            </label>
-
-            <select
-              style={selectStyle}
-              value={targetDigit}
-              onChange={(event) =>
-                setTargetDigit(Number(event.target.value))
-              }
-            >
-              {Array.from(
-                { length: 10 },
-                (_, digit) => (
-                  <option key={digit} value={digit}>
-                    Digit {digit}
-                  </option>
-                )
-              )}
-            </select>
-          </>
-        )}
-
-        {(contract === "OVER" ||
-          contract === "UNDER") && (
-          <>
-            <label style={mutedStyle}>
-              Barrier digit
-            </label>
-
-            <select
-              style={selectStyle}
-              value={barrierDigit}
-              onChange={(event) =>
-                setBarrierDigit(Number(event.target.value))
-              }
-            >
-              {Array.from(
-                { length: 10 },
-                (_, digit) => (
-                  <option key={digit} value={digit}>
-                    {digit}
-                  </option>
-                )
-              )}
-            </select>
-          </>
-        )}
-
-        <div style={{ marginTop: 18 }}>
-          <div style={mutedStyle}>
-            Historical frequency in selected window
-          </div>
-
-          <strong
-            style={{
-              fontSize: 30,
-              color: "#55d6be",
-            }}
-          >
-            {selectedPercentage.toFixed(1)}%
-          </strong>
-        </div>
-
-        <p style={mutedStyle}>
-          This is a historical sample frequency, not the probability
-          of the next result.
+        <p style={muted}>
+          Supported contracts: Matches, Differs, Even, Odd, Rise and Fall.
+          Over/Under and barrier controls have been removed.
         </p>
       </section>
 
-      {/* DIGIT DISTRIBUTION */}
-
-      <section style={panelStyle}>
+      <section style={panel}>
         <h2 style={{ fontSize: 17, marginTop: 0 }}>
           DIGIT DISTRIBUTION
         </h2>
 
         {digitCounts.map((count, digit) => {
-          const pct = Number(
-            percentage(count, totalTicks)
-          );
+          const value = percentage(count, ticks.length);
 
           return (
-            <div
-              key={digit}
-              style={{ marginBottom: 12 }}
-            >
+            <div key={digit} style={{ marginBottom: 11 }}>
               <div
                 style={{
                   display: "flex",
                   justifyContent: "space-between",
                   fontSize: 13,
-                  marginBottom: 5,
+                  marginBottom: 4,
                 }}
               >
                 <span>Digit {digit}</span>
-
                 <span>
-                  {pct.toFixed(1)}% ({count})
+                  {value.toFixed(1)}% ({count})
                 </span>
               </div>
 
               <div
                 style={{
-                  background: "#26344d",
-                  height: 9,
+                  height: 8,
                   borderRadius: 20,
+                  background: "#293750",
                   overflow: "hidden",
                 }}
               >
                 <div
                   style={{
-                    width: `${pct}%`,
+                    width: `${value}%`,
                     height: "100%",
                     background: "#55d6be",
-                    borderRadius: 20,
                   }}
                 />
               </div>
@@ -1050,102 +730,80 @@ export default function Home() {
         })}
       </section>
 
-      {/* ANALYSIS ENGINE */}
-
-      <section style={panelStyle}>
+      <section style={panel}>
         <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          ANALYSIS ENGINE
+          SIGNAL ANALYSIS ENGINE
         </h2>
 
-        <div
-          style={{
-            display: "flex",
-            gap: 10,
-            flexWrap: "wrap",
-          }}
-        >
-          <button
-            style={buttonStyle}
-            onClick={analyseNow}
-          >
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button style={button} onClick={analyseNow}>
             ANALYSE NOW
           </button>
 
           <button
-            style={buttonStyle}
-            onClick={() =>
-              setScannerActive((value) => !value)
-            }
+            style={button}
+            onClick={() => setScannerOn((value) => !value)}
           >
-            {scannerActive
-              ? "PAUSE SCANNER"
-              : "RESUME SCANNER"}
+            {scannerOn ? "PAUSE SCANNER" : "RESUME SCANNER"}
           </button>
         </div>
 
-        <div style={{ marginTop: 18 }}>
-          <div style={mutedStyle}>
-            Analysis status
-          </div>
-
-          <strong
-            style={{
-              fontSize: 19,
-              color: "#55d6be",
-            }}
-          >
-            {analysisSignal}
-          </strong>
-        </div>
-
-        <p style={mutedStyle}>
-          Contract: {contract}
-        </p>
-
-        <p style={mutedStyle}>
-          Historical frequency: {selectedPercentage.toFixed(1)}%
-        </p>
-
-        <p style={mutedStyle}>
-          Latest digit:{" "}
-          {lastDigit === null ? "--" : lastDigit}
-        </p>
-
-        <p style={mutedStyle}>
-          Previous digit:{" "}
-          {previousDigit === null ? "--" : previousDigit}
-        </p>
-
-        <p style={mutedStyle}>
-          Latest price direction: {riseFall}
-        </p>
-
-        <p style={mutedStyle}>
-          Last analysis: {analysisTime || "Not analysed yet"}
-        </p>
-
         <p
           style={{
-            color: "#ffc66d",
-            fontSize: 13,
+            marginTop: 18,
+            color: analysis ? "#55d6be" : "#ffc66d",
+            fontWeight: 800,
           }}
         >
-          Historical frequency does not guarantee the next tick.
-          Use this information for analysis, not as a guaranteed
-          trading signal.
+          {analysis ? "CANDIDATE FOR REVIEW" : "SIGNAL STATUS"}
+        </p>
+
+        <p>{analysisMessage}</p>
+
+        {analysis && (
+          <div
+            style={{
+              background: "#0c1526",
+              borderRadius: 10,
+              padding: 12,
+              marginTop: 10,
+            }}
+          >
+            <strong style={{ fontSize: 20 }}>{analysis.label}</strong>
+
+            <p style={muted}>
+              Full-window historical rate: {analysis.sampleRate.toFixed(1)}%
+            </p>
+
+            <p style={muted}>
+              Recent 100-tick rate: {analysis.recentRate.toFixed(1)}%
+            </p>
+
+            <p style={muted}>
+              Difference from baseline: {analysis.edge.toFixed(1)} percentage points
+            </p>
+
+            <p style={{ color: "#ffc66d", fontSize: 13 }}>
+              This is a statistical screening result, not a true next-tick probability or a trade instruction.
+            </p>
+          </div>
+        )}
+
+        <p style={muted}>
+          The engine compares the selected Matches/Differs digit, Even/Odd,
+          and Rise/Fall. It requires at least 100 ticks and a historical
+          difference from baseline. This screening method is experimental
+          and has not yet been validated on unseen data.
         </p>
       </section>
 
-      {/* ALL MARKETS */}
-
-      <section style={panelStyle}>
+      <section style={panel}>
         <h2 style={{ fontSize: 17, marginTop: 0 }}>
           ALL MARKETS STATUS
         </h2>
 
         {MARKETS.map((market) => {
-          const data =
-            markets[market.symbol] || emptyMarket();
+          const data = markets[market.symbol] || blankMarket();
 
           return (
             <div
@@ -1154,82 +812,60 @@ export default function Home() {
                 display: "flex",
                 justifyContent: "space-between",
                 gap: 8,
-                padding: "10px 0",
+                padding: "9px 0",
                 borderBottom: "1px solid #293650",
+                fontSize: 13,
               }}
             >
-              <span style={{ fontSize: 13 }}>
-                {market.name}
-              </span>
+              <span>{market.name}</span>
 
               <span
                 style={{
-                  color: statusColor(data.status),
-                  fontSize: 13,
-                  textAlign: "right",
+                  color: data.status === "LIVE" ? "#36d399" : "#ffc66d",
                 }}
               >
-                {data.status === "LIVE"
-                  ? data.price
-                  : data.status}
+                {data.status === "LIVE" ? data.price : data.status}
               </span>
             </div>
           );
         })}
       </section>
 
-      {/* TRADE EXECUTION */}
-
-      <section style={panelStyle}>
+      <section style={panel}>
         <h2 style={{ fontSize: 17, marginTop: 0 }}>
-          DERIV ACCOUNT & TRADE EXECUTION
+          ACCOUNT & MANUAL TRADE APPROVAL
         </h2>
 
-        <div
-          style={{
-            color: "#ffc66d",
-            fontWeight: 800,
-          }}
-        >
+        <strong style={{ color: "#ffc66d" }}>
           ACCOUNT NOT CONNECTED
-        </div>
+        </strong>
 
-        <p style={mutedStyle}>
-          Your public market scanner is separate from your private
-          Deriv account. OAuth account connection and demo trade
-          execution must be configured through secure server routes.
+        <p style={muted}>
+          This version is a public market scanner and analysis tool.
+          OAuth account connection, demo trade proposals, and a separate
+          approval step still need to be implemented and tested securely.
         </p>
 
         <button
           style={{
-            ...buttonStyle,
+            ...button,
             width: "100%",
-            opacity: 0.5,
+            opacity: 0.55,
             cursor: "not-allowed",
           }}
           disabled
         >
-          DEMO TRADING — NOT CONNECTED
+          DEMO TRADE — NOT CONNECTED
         </button>
 
-        <p
-          style={{
-            color: "#ffc66d",
-            fontSize: 13,
-          }}
-        >
-          No real-money trades can be placed by this version.
-          Never put your Deriv access token in this page.
+        <p style={{ color: "#ffc66d", fontSize: 13 }}>
+          No trades are placed by this page. Never paste your Deriv access
+          token into browser code.
         </p>
       </section>
 
-      <footer
-        style={{
-          textAlign: "center",
-          ...mutedStyle,
-        }}
-      >
-        HOPE AI DERIV ANALYZER PRO • PUBLIC MARKET DATA BUILD
+      <footer style={{ ...muted, textAlign: "center" }}>
+        HOPE AI DERIV ANALYZER PRO · PUBLIC MARKET DATA BUILD
       </footer>
     </main>
   );
