@@ -95,8 +95,7 @@ export default function Home() {
   const [contract, setContract] = useState("DIFFERS");
   const [targetDigit, setTargetDigit] = useState(5);
   const [barrierDigit, setBarrierDigit] = useState(4);
-  const [windowSize, setWindowSize] =
-    useState<number>(500);
+  const [windowSize, setWindowSize] = useState<number>(500);
 
   const [markets, setMarkets] =
     useState<Record<string, MarketData>>(makeInitialMarkets);
@@ -109,6 +108,7 @@ export default function Home() {
   const [availableSymbols, setAvailableSymbols] = useState<string[]>([]);
   const [scannerActive, setScannerActive] = useState(true);
   const [analysisTime, setAnalysisTime] = useState("");
+  const [rawResponse, setRawResponse] = useState("");
 
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -123,10 +123,7 @@ export default function Home() {
     scannerActiveRef.current = scannerActive;
   }, [scannerActive]);
 
-  // --------------------------------------------------
   // PUBLIC DERIV MARKET DATA CONNECTION
-  // No App ID 1089 is used here.
-  // --------------------------------------------------
 
   useEffect(() => {
     activeRef.current = true;
@@ -146,7 +143,9 @@ export default function Home() {
       } catch (error) {
         setConnectionStatus("ERROR");
         setConnectionError(
-          error instanceof Error ? error.message : "Could not create WebSocket"
+          error instanceof Error
+            ? error.message
+            : "Could not create WebSocket"
         );
 
         reconnectTimerRef.current = setTimeout(
@@ -164,7 +163,6 @@ export default function Home() {
         setConnectionStatus("CONNECTED");
         setConnectionError("");
 
-        // Request the available market symbols.
         socket.send(
           JSON.stringify({
             active_symbols: "brief",
@@ -187,40 +185,50 @@ export default function Home() {
 
         let data: ApiMessage;
 
+        // Corrected JSON parsing and debug logging.
         try {
           data = JSON.parse(event.data);
-        } console.log("DERIV RAW RESPONSE:", data);
-        catch {
-          setConnectionError("Could not read the market-data response.");
+          setRawResponse(JSON.stringify(data, null, 2).slice(0, 2000));
+          console.log("DERIV RAW RESPONSE:", data);
+        } catch {
+          setConnectionError(
+            "Could not read the market-data response."
+          );
           return;
         }
 
         if (data.error) {
           const message =
-            data.error.message || data.error.code || "Deriv API error";
+            data.error.message ||
+            data.error.code ||
+            "Deriv API error";
 
           setConnectionError(message);
           return;
         }
 
-        // Subscribe only to symbols actually returned by Deriv.
+        // Read available symbols.
         if (
           data.msg_type === "active_symbols" &&
           Array.isArray(data.active_symbols)
         ) {
           const returnedSymbols = data.active_symbols
             .map((item) => item.symbol)
-            .filter((symbol): symbol is string => Boolean(symbol));
+            .filter(
+              (symbol): symbol is string => Boolean(symbol)
+            );
 
           const wantedSymbols = MARKETS
             .map((market) => market.symbol)
-            .filter((symbol) => returnedSymbols.includes(symbol));
+            .filter((symbol) =>
+              returnedSymbols.includes(symbol)
+            );
 
           setAvailableSymbols(wantedSymbols);
 
           if (wantedSymbols.length === 0) {
             setConnectionError(
-              "No requested markets were returned by this endpoint. Check the API response and supported symbols."
+              "No requested markets were returned. See the API response below."
             );
             return;
           }
@@ -255,7 +263,7 @@ export default function Home() {
           return;
         }
 
-        // Receive and store live tick data.
+        // Receive live tick data.
         if (data.msg_type === "tick" && data.tick) {
           const symbol = data.tick.symbol;
           const quote = Number(data.tick.quote);
@@ -280,11 +288,14 @@ export default function Home() {
           const tick: Tick = {
             quote,
             digit,
-            time: Number.isFinite(epoch) ? epoch : Date.now() / 1000,
+            time: Number.isFinite(epoch)
+              ? epoch
+              : Date.now() / 1000,
           };
 
           setMarkets((previous) => {
-            const oldMarket = previous[symbol] || emptyMarket();
+            const oldMarket =
+              previous[symbol] || emptyMarket();
 
             const updatedTicks = [
               ...oldMarket.ticks,
@@ -373,9 +384,7 @@ export default function Home() {
     };
   }, []);
 
-  // --------------------------------------------------
   // SELECTED MARKET ANALYSIS
-  // --------------------------------------------------
 
   const selectedData =
     markets[selectedMarket] || emptyMarket();
@@ -426,7 +435,9 @@ export default function Home() {
   const previousTick = ticks[ticks.length - 2];
 
   const lastDigit = lastTick ? lastTick.digit : null;
-  const previousDigit = previousTick ? previousTick.digit : null;
+  const previousDigit = previousTick
+    ? previousTick.digit
+    : null;
 
   let riseCount = 0;
   let fallCount = 0;
@@ -442,7 +453,8 @@ export default function Home() {
     }
   }
 
-  const directionTotal = riseCount + fallCount + unchangedCount;
+  const directionTotal =
+    riseCount + fallCount + unchangedCount;
 
   const riseFall =
     !lastTick || !previousTick
@@ -490,9 +502,7 @@ export default function Home() {
     setAnalysisTime(new Date().toLocaleTimeString());
   }
 
-  // --------------------------------------------------
   // STYLES
-  // --------------------------------------------------
 
   const panelStyle: CSSProperties = {
     background: "#151d30",
@@ -532,7 +542,10 @@ export default function Home() {
       return "#36d399";
     }
 
-    if (status === "CONNECTING" || status === "SUBSCRIBING") {
+    if (
+      status === "CONNECTING" ||
+      status === "SUBSCRIBING"
+    ) {
       return "#ffc66d";
     }
 
@@ -552,7 +565,13 @@ export default function Home() {
       }}
     >
       <header style={{ marginBottom: 20 }}>
-        <div style={{ color: "#55d6be", fontSize: 12, fontWeight: 800 }}>
+        <div
+          style={{
+            color: "#55d6be",
+            fontSize: 12,
+            fontWeight: 800,
+          }}
+        >
           HOPE AI • DERIV ANALYZER PRO
         </div>
 
@@ -597,6 +616,29 @@ export default function Home() {
           <p style={{ color: "#ff8c8c", fontSize: 13 }}>
             {connectionError}
           </p>
+        )}
+
+        {rawResponse && (
+          <details style={{ marginTop: 12 }}>
+            <summary style={{ cursor: "pointer", color: "#55d6be" }}>
+              View Deriv API response
+            </summary>
+            <pre
+              style={{
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
+                fontSize: 11,
+                color: "#c6d5ed",
+                background: "#0d1525",
+                padding: 10,
+                borderRadius: 8,
+                maxHeight: 250,
+                overflow: "auto",
+              }}
+            >
+              {rawResponse}
+            </pre>
+          </details>
         )}
 
         <p style={mutedStyle}>
@@ -885,9 +927,7 @@ export default function Home() {
                   textAlign: "right",
                 }}
               >
-                {data.status === "LIVE"
-                  ? data.price
-                  : data.status}
+                {data.status === "LIVE" ? data.price : data.status}
               </span>
             </div>
           );
