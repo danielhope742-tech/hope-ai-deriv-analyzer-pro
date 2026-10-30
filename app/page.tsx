@@ -1,12 +1,12 @@
 
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const APP_ID = "1089";
 
 const SYNTHETIC_URL =
-  `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
+  `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}&l=EN&brand=deriv`;
 
 const OPTIONS_URL =
   "wss://api.derivws.com/trading/v1/options/ws/public";
@@ -31,7 +31,11 @@ type MarketData = {
   status: string;
 };
 
-type ConnectionStatus = "CONNECTING" | "CONNECTED" | "ERROR" | "CLOSED";
+type ConnectionStatus =
+  | "CONNECTING"
+  | "CONNECTED"
+  | "ERROR"
+  | "CLOSED";
 
 function emptyMarket(): MarketData {
   return {
@@ -56,7 +60,7 @@ export default function Home() {
   const [selectedMarket, setSelectedMarket] = useState("R_100");
   const [contract, setContract] = useState("DIFFERS");
   const [targetDigit, setTargetDigit] = useState(5);
-  const [overUnderDigit, setOverUnderDigit] = useState(4);
+  const [barrierDigit, setBarrierDigit] = useState(4);
 
   const [markets, setMarkets] = useState<Record<string, MarketData>>(() => {
     const initial: Record<string, MarketData> = {};
@@ -68,12 +72,12 @@ export default function Home() {
 
   const [syntheticStatus, setSyntheticStatus] =
     useState<ConnectionStatus>("CONNECTING");
-
   const [syntheticError, setSyntheticError] = useState("");
+  const [syntheticMessages, setSyntheticMessages] = useState(0);
+  const [syntheticReconnects, setSyntheticReconnects] = useState(0);
 
   const [optionsStatus, setOptionsStatus] =
     useState<ConnectionStatus>("CONNECTING");
-
   const [optionsError, setOptionsError] = useState("");
   const [optionsMessages, setOptionsMessages] = useState(0);
   const [optionsSymbols, setOptionsSymbols] = useState(0);
@@ -82,8 +86,12 @@ export default function Home() {
   const [scannerActive, setScannerActive] = useState(true);
   const [analysisTime, setAnalysisTime] = useState("");
 
+  const syntheticSocketRef = useRef<WebSocket | null>(null);
+  const currentSubscriptionRef = useRef<string | null>(null);
+
   // --------------------------------------------------
-  // CONNECTION 1: EXISTING DERIV SYNTHETIC INDICES API
+  // SYNTHETIC INDICES CONNECTION
+  // One selected market subscription at a time.
   // --------------------------------------------------
 
   useEffect(() => {
@@ -98,9 +106,11 @@ export default function Home() {
 
       setSyntheticStatus("CONNECTING");
       setSyntheticError("");
+      currentSubscriptionRef.current = null;
 
       try {
         socket = new WebSocket(SYNTHETIC_URL);
+        syntheticSocketRef.current = socket;
 
         socket.onopen = () => {
           if (!active || !socket) return;
@@ -109,30 +119,35 @@ export default function Home() {
           setSyntheticStatus("CONNECTED");
           setSyntheticError("");
 
-          MARKETS.forEach((market) => {
-            socket?.send(
-              JSON.stringify({
-                ticks: market.symbol,
-                subscribe: 1,
-              })
-            );
-          });
+          socket.send(
+            JSON.stringify({
+              ticks: selectedMarket,
+              subscribe: 1,
+              req_id: 100,
+            })
+          );
+
+          currentSubscriptionRef.current = selectedMarket;
 
           pingTimer = setInterval(() => {
             if (socket?.readyState === WebSocket.OPEN) {
               socket.send(JSON.stringify({ ping: 1 }));
             }
-          }, 30000);
+          }, 12000);
         };
 
         socket.onmessage = (event) => {
           if (!active) return;
 
+          setSyntheticMessages((count) => count + 1);
+
           try {
             const data = JSON.parse(event.data);
 
             if (data.error) {
-              setSyntheticError(data.error.message || "Deriv API error");
+              setSyntheticError(
+                data.error.message || "Deriv API returned an error"
+              );
               return;
             }
 
@@ -149,19 +164,17 @@ export default function Home() {
                 const current = previous[symbol];
                 if (!current) return previous;
 
-                const nextTicks = [
-                  ...current.ticks,
-                  {
-                    quote,
-                    digit,
-                    time: Date.now(),
-                  },
-                ].slice(-1000);
-
                 return {
                   ...previous,
                   [symbol]: {
-                    ticks: nextTicks,
+                    ticks: [
+                      ...current.ticks,
+                      {
+                        quote,
+                        digit,
+                        time: Date.now(),
+                      },
+                    ].slice(-1000),
                     price: quote,
                     status: "LIVE",
                   },
@@ -169,14 +182,16 @@ export default function Home() {
               });
             }
           } catch {
-            setSyntheticError("Could not read a tick message");
+            setSyntheticError("Could not read a tick response");
           }
         };
 
         socket.onerror = () => {
           if (!active) return;
           setSyntheticStatus("ERROR");
-          setSyntheticError("Synthetic WebSocket connection error");
+          setSyntheticError(
+            "WebSocket error. Check the connection and browser console."
+          );
         };
 
         socket.onclose = (event) => {
@@ -190,6 +205,8 @@ export default function Home() {
           );
 
           if (pingTimer) clearInterval(pingTimer);
+
+          setSyntheticReconnects((count) => count + 1);
 
           reconnectTimer = setTimeout(
             connectSynthetic,
@@ -223,11 +240,13 @@ export default function Home() {
         socket.onclose = null;
         socket.close();
       }
+
+      syntheticSocketRef.current = null;
     };
-  }, []);
+  }, [selectedMarket]);
 
   // --------------------------------------------------
-  // CONNECTION 2: NEW DERIV OPTIONS PUBLIC API
+  // OPTIONS PUBLIC CONNECTION
   // --------------------------------------------------
 
   useEffect(() => {
@@ -253,7 +272,7 @@ export default function Home() {
           setOptionsStatus("CONNECTED");
           setOptionsError("");
 
-          // Request available public markets.
+          // Ask the public endpoint for its available symbols.
           socket.send(
             JSON.stringify({
               active_symbols: "brief",
@@ -261,7 +280,7 @@ export default function Home() {
             })
           );
 
-          // Public API market-data test subscription.
+          // Test a public tick subscription.
           socket.send(
             JSON.stringify({
               ticks: "1HZ100V",
@@ -274,7 +293,7 @@ export default function Home() {
             if (socket?.readyState === WebSocket.OPEN) {
               socket.send(JSON.stringify({ ping: 1 }));
             }
-          }, 30000);
+          }, 12000);
         };
 
         socket.onmessage = (event) => {
@@ -287,7 +306,7 @@ export default function Home() {
 
             if (data.error) {
               setOptionsError(
-                data.error.message || "Options API returned an error"
+                data.error.message || "Options API error"
               );
               return;
             }
@@ -308,7 +327,7 @@ export default function Home() {
               }
             }
           } catch {
-            setOptionsError("Could not read Options API message");
+            setOptionsError("Could not read Options API response");
           }
         };
 
@@ -389,19 +408,22 @@ export default function Home() {
   const differCount = totalTicks - matchCount;
 
   const evenCount = digitCounts.reduce(
-    (sum, count, digit) => sum + (digit % 2 === 0 ? count : 0),
+    (sum, count, digit) =>
+      sum + (digit % 2 === 0 ? count : 0),
     0
   );
 
   const oddCount = totalTicks - evenCount;
 
   const overCount = digitCounts.reduce(
-    (sum, count, digit) => sum + (digit > overUnderDigit ? count : 0),
+    (sum, count, digit) =>
+      sum + (digit > barrierDigit ? count : 0),
     0
   );
 
   const underCount = digitCounts.reduce(
-    (sum, count, digit) => sum + (digit < overUnderDigit ? count : 0),
+    (sum, count, digit) =>
+      sum + (digit < barrierDigit ? count : 0),
     0
   );
 
@@ -414,7 +436,7 @@ export default function Home() {
     : null;
 
   const riseFall =
-    selectedData.price === null || ticks.length < 2
+    ticks.length < 2
       ? "WAITING"
       : ticks[ticks.length - 1].quote >
           ticks[ticks.length - 2].quote
@@ -462,7 +484,7 @@ export default function Home() {
   }
 
   // --------------------------------------------------
-  // UI
+  // STYLES
   // --------------------------------------------------
 
   const panelStyle: React.CSSProperties = {
@@ -542,6 +564,14 @@ export default function Home() {
           API: Deriv WebSocket v3 • App ID: {APP_ID}
         </p>
 
+        <p style={mutedStyle}>
+          Incoming messages: {syntheticMessages}
+        </p>
+
+        <p style={mutedStyle}>
+          Reconnection attempts: {syntheticReconnects}
+        </p>
+
         {syntheticError && (
           <p style={{ color: "#ff8c8c", fontSize: 13 }}>
             {syntheticError}
@@ -565,7 +595,7 @@ export default function Home() {
         </p>
 
         <p style={mutedStyle}>
-          Available symbols received: {optionsSymbols}
+          Available symbols: {optionsSymbols}
         </p>
 
         <p style={mutedStyle}>
@@ -580,8 +610,7 @@ export default function Home() {
         )}
 
         <p style={mutedStyle}>
-          Public market-data connection only. It does not access your account
-          or place trades.
+          Public market-data connection only. No account access or trading.
         </p>
       </section>
 
@@ -678,10 +707,8 @@ export default function Home() {
             <label style={mutedStyle}>Barrier digit</label>
             <select
               style={selectStyle}
-              value={overUnderDigit}
-              onChange={(event) =>
-                setOverUnderDigit(Number(event.target.value))
-              }
+              value={barrierDigit}
+              onChange={(event) => setBarrierDigit(Number(event.target.value))}
             >
               {Array.from({ length: 10 }, (_, digit) => (
                 <option key={digit} value={digit}>
@@ -693,15 +720,18 @@ export default function Home() {
         )}
 
         <div style={{ marginTop: 18 }}>
-          <div style={mutedStyle}>Historical frequency in collected ticks</div>
+          <div style={mutedStyle}>
+            Historical frequency in collected ticks
+          </div>
+
           <strong style={{ fontSize: 30, color: "#55d6be" }}>
             {selectedPercentage.toFixed(1)}%
           </strong>
         </div>
 
         <p style={mutedStyle}>
-          This percentage describes the collected sample. It is not the
-          probability of the next result.
+          This describes the historical sample, not the probability of the
+          next result.
         </p>
       </section>
 
@@ -726,7 +756,9 @@ export default function Home() {
                 }}
               >
                 <span>Digit {digit}</span>
-                <span>{pct.toFixed(1)}% ({count})</span>
+                <span>
+                  {pct.toFixed(1)}% ({count})
+                </span>
               </div>
 
               <div
@@ -751,7 +783,7 @@ export default function Home() {
         })}
       </section>
 
-      {/* ANALYSIS PANEL */}
+      {/* ANALYSIS ENGINE */}
 
       <section style={panelStyle}>
         <h2 style={{ fontSize: 17, marginTop: 0 }}>
@@ -776,14 +808,13 @@ export default function Home() {
 
         <div style={{ marginTop: 18 }}>
           <div style={mutedStyle}>Analysis status</div>
+
           <strong style={{ fontSize: 19, color: "#55d6be" }}>
             {analysisSignal}
           </strong>
         </div>
 
-        <p style={mutedStyle}>
-          Contract: {contract}
-        </p>
+        <p style={mutedStyle}>Contract: {contract}</p>
 
         <p style={mutedStyle}>
           Historical frequency: {selectedPercentage.toFixed(1)}%
@@ -806,12 +837,12 @@ export default function Home() {
         </p>
 
         <p style={{ color: "#ffc66d", fontSize: 13 }}>
-          WAIT for more data when the sample is small. This scanner does not
-          predict or guarantee the next tick.
+          A small sample is not enough to establish an advantage. This tool
+          does not predict or guarantee the next tick.
         </p>
       </section>
 
-      {/* MARKET SUMMARY */}
+      {/* ALL MARKETS STATUS */}
 
       <section style={panelStyle}>
         <h2 style={{ fontSize: 17, marginTop: 0 }}>
@@ -832,7 +863,15 @@ export default function Home() {
               }}
             >
               <span>{market.name}</span>
-              <span style={{ color: data?.price !== null ? "#36d399" : "#ff8c8c" }}>
+
+              <span
+                style={{
+                  color:
+                    data?.status === "LIVE"
+                      ? "#36d399"
+                      : "#ff8c8c",
+                }}
+              >
                 {data?.price === null || data?.price === undefined
                   ? "WAITING"
                   : data.price}
@@ -842,7 +881,7 @@ export default function Home() {
         })}
       </section>
 
-      {/* TRADING PANEL */}
+      {/* TRADE EXECUTION */}
 
       <section style={panelStyle}>
         <h2 style={{ fontSize: 17, marginTop: 0 }}>
@@ -877,7 +916,7 @@ export default function Home() {
       </section>
 
       <footer style={{ textAlign: "center", ...mutedStyle }}>
-        HOPE AI DERIV ANALYZER • DATA MONITORING BUILD
+        HOPE AI DERIV ANALYZER • LIVE DATA BUILD
       </footer>
     </main>
   );
